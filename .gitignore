@@ -1,0 +1,54 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs and runtime output
+*.log
+logs/
+cache/
+output/
+work/
+workdir/
+validation_workdir*/
+report_smoke/
+state_smoke/
+history_smoke/
+manifest_smoke/
+bootstrap_smoke_tmp/
+bootstrap_state_smoke/
+
+# Downloaded / generated media
+*.mp4
+*.mp4.part
+*.mov
+*.avi
+*.mkv
+*.webm
+*.vtt
+*.srt
+
+# Local editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
