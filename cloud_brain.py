@@ -1,0 +1,1867 @@
+import os
+import glob
+import os
+import base64
+import re
+import json
+import io
+import math
+import logging
+import threading
+from types import SimpleNamespace
+from pathlib import Path
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from json_repair import repair_json
+from openai import OpenAI
+import requests
+
+load_dotenv()
+
+app = FastAPI()
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+PRIMARY_VISION_URL = os.getenv("PRIMARY_VISION_URL", "").strip()
+PRIMARY_VISION_KEY = os.getenv("PRIMARY_VISION_KEY", "").strip()
+PRIMARY_VISION_MODEL = os.getenv("PRIMARY_VISION_MODEL", "Qwen/Qwen2.5-VL-72B-Instruct").strip()
+PRIMARY_VISION_PROVIDER = os.getenv("PRIMARY_VISION_PROVIDER", "PRIMARY").strip()
+
+PUTER_AUTH_TOKEN = str(os.getenv("PUTER_AUTH_TOKEN") or "").strip()
+PUTER_MODEL = str(
+    os.getenv("PUTER_MODEL") or "qwen/qwen2.5-vl-72b-instruct"
+).strip()
+
+primary_client = OpenAI(
+    base_url=PRIMARY_VISION_URL,
+    api_key=PRIMARY_VISION_KEY,
+)
+# 2. Fallback Client (Puter Free Tier)
+fallback_client = OpenAI(
+    base_url="https://api.puter.com/puterai/openai/v1/",
+    api_key=PUTER_AUTH_TOKEN,
+)
+MODEL_ID = PRIMARY_VISION_MODEL
+
+_runtime_lock = threading.Lock()
+_runtime_state = {
+    "active_provider": PRIMARY_VISION_PROVIDER,
+    "active_model": PRIMARY_VISION_MODEL,
+    "primary_provider": PRIMARY_VISION_PROVIDER,
+    "primary_model": PRIMARY_VISION_MODEL,
+    "primary_base_url": PRIMARY_VISION_URL,
+    "fallback_provider": "PUTER",
+    "fallback_model": PUTER_MODEL,
+    "fallback_enabled": bool(PUTER_AUTH_TOKEN),
+    "last_error": "",
+}
+
+
+def _mask_secret(value: str) -> str:
+    return "***" if str(value or "").strip() else ""
+
+
+def _secret_status(value: str) -> dict:
+    present = bool(str(value or "").strip())
+    return {
+        "present": present,
+        "value": _mask_secret(value),
+    }
+
+
+class PlaybookRequest(BaseModel):
+    os_name: str
+    video_url: str
+    tutorial_frame_path: str | None = None
+    context: str = ""
+    timecode: str = ""
+    phase_contract: dict | None = None
+    recent_state: dict = {}
+    milestone_context: dict = {}
+
+
+class SetupRequest(BaseModel):
+    os_name: str
+    video_url: str = ""
+    transcript_summary: str = ""
+    target_workspace: list[str] = []
+    bootstrap_cwd: str = ""
+
+
+class ProposeRequest(BaseModel):
+    os_name: str
+    video_url: str = ""
+    local_tutorial_path: str = ""
+    transcript_summary: str = ""
+    expected_environment: str = ""
+    visual_events: list[dict] = []
+    candidates: list[dict] = []
+    global_context_path: str = ""
+    global_context_description: dict = {}
+    keyframe_paths: list[str] = []
+    keyframe_descriptions: list[dict] = []
+
+
+def _encode_image_file(path: Path | str | None) -> str | None:
+    try:
+        if not path:
+            return None
+        path = Path(path)
+        if not path.exists():
+            return None
+        return get_compressed_base64(str(path))
+    except Exception:
+        return None
+
+
+def _encode_image_for_model(image_path_or_obj, *, scale: float | None = None):
+    from PIL import Image
+
+    img = Image.open(image_path_or_obj) if isinstance(image_path_or_obj, (str, Path)) else image_path_or_obj
+    img = img.convert("RGB")
+    raw_width, raw_height = img.size
+    if raw_width <= 0 or raw_height <= 0:
+        raise ValueError("Image dimensions must be positive.")
+    if scale is None:
+        scale = min(1280 / raw_width, 720 / raw_height, 1.0)
+    scaled_width = max(1, int(round(raw_width * scale)))
+    scaled_height = max(1, int(round(raw_height * scale)))
+    if (scaled_width, scaled_height) != img.size:
+        img = img.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG", quality=70)
+    return base64.b64encode(buffered.getvalue()).decode("utf-8"), img.size, scale
+
+
+def get_compressed_base64(image_path_or_obj):
+    encoded, _, _ = _encode_image_for_model(image_path_or_obj)
+    return encoded
+
+
+def get_local_desktop_image():
+    """Capture the user's current desktop directly as a PIL image."""
+    try:
+        from PIL import ImageGrab
+    except Exception:
+        return None
+
+    try:
+        return ImageGrab.grab(all_screens=True)
+    except Exception:
+        return None
+
+
+def get_local_desktop_base64() -> str | None:
+    """Capture the user's current desktop directly."""
+    try:
+        screenshot = get_local_desktop_image()
+        if screenshot is None:
+            return None
+        return get_compressed_base64(screenshot)
+    except Exception:
+        return None
+
+
+def get_tutorial_frame_base64(explicit_path: str | None = None) -> str | None:
+    """Load a tutorial frame extracted during ingestion."""
+    encoded = _encode_image_file(explicit_path)
+    if encoded:
+        return encoded
+
+    work_root = Path(os.environ.get("MIMIQ_WORKDIR", Path(os.environ.get("TEMP", "C:\\Windows\\Temp")) / "mimiq_work"))
+    frames_dir = work_root / "frames"
+    try:
+        tutorial_frames = sorted(frames_dir.glob("frame_*.png"))
+        if tutorial_frames:
+            return _encode_image_file(tutorial_frames[-1])
+    except Exception:
+        pass
+    return None
+
+
+def crop_desktop_to_app_region(screenshot, phase_contract: dict | None):
+    try:
+        if screenshot is None:
+            return None, None, None
+
+        full_b64, _, full_scale = _encode_image_for_model(screenshot)
+        if not phase_contract:
+            return full_b64, None, None
+
+        workspace_items = _normalize_target_workspace(phase_contract.get("required_workspace") or [])
+        target_app = _normalize_workspace_item(phase_contract.get("expected_target_app_name") or "")
+        if not workspace_items or len(workspace_items) < 2 or not target_app:
+            return full_b64, None, None
+
+        raw_width, raw_height = screenshot.size
+        if raw_width <= 1 or raw_height <= 1:
+            return full_b64, None, None
+
+        target_index = None
+        for index, item in enumerate(workspace_items[:2]):
+            if _normalize_workspace_item(item) == target_app:
+                target_index = index
+                break
+        if target_index is None:
+            return full_b64, None, None
+
+        midpoint = raw_width // 2
+        if target_index == 0:
+            raw_bbox = (0, 0, midpoint, raw_height)
+        else:
+            raw_bbox = (midpoint, 0, raw_width, raw_height)
+
+        cropped = screenshot.crop(raw_bbox)
+        cropped_b64, _, _ = _encode_image_for_model(cropped, scale=full_scale)
+        scaled_bbox = (
+            int(round(raw_bbox[0] * full_scale)),
+            int(round(raw_bbox[1] * full_scale)),
+            int(round(raw_bbox[2] * full_scale)),
+            int(round(raw_bbox[3] * full_scale)),
+        )
+        return full_b64, cropped_b64, scaled_bbox
+    except Exception:
+        try:
+            return get_compressed_base64(screenshot), None, None
+        except Exception:
+            return None, None, None
+
+
+def build_browser_playbook(x: int, y: int, explanation: str, action_name: str = "click"):
+    return {
+        "playbook": [
+            {
+                "step_id": 1,
+                "title": "vision browser action",
+                "intent": "execute browser action from frame analysis",
+                "expected_tool": "browser",
+                "original_command": "",
+                "adapted_command": "",
+                "safety_level": "green",
+                "notes": "",
+                "reasoning": explanation,
+                "target_app_name": "Browser",
+                "actions": [
+                    {
+                        "type": "click",
+                        "target_description": action_name,
+                        "coordinates": [x, y],
+                    }
+                ],
+                "verification": {
+                    "expected_state": explanation,
+                },
+            }
+        ]
+    }
+
+
+def create_completion(messages):
+    return create_completion_with_fallback(messages=messages, timeout=15)
+
+
+def _set_runtime_state(*, provider: str, model: str, last_error: str = "") -> None:
+    with _runtime_lock:
+        _runtime_state["active_provider"] = provider
+        _runtime_state["active_model"] = model
+        _runtime_state["last_error"] = last_error
+
+
+def get_runtime_state() -> dict:
+    with _runtime_lock:
+        return dict(_runtime_state)
+
+
+def create_completion_with_fallback(*, messages, timeout: int = 15, temperature: float = 0.0):
+    logging.info("Attempting inference via primary endpoint: %s (%s)", PRIMARY_VISION_PROVIDER, PRIMARY_VISION_MODEL)
+    try:
+        response = primary_client.chat.completions.create(
+            model=PRIMARY_VISION_MODEL,
+            messages=messages,
+            temperature=temperature,
+            timeout=timeout,
+        )
+        _set_runtime_state(provider=PRIMARY_VISION_PROVIDER, model=PRIMARY_VISION_MODEL, last_error="")
+        return response
+    except Exception as exc:
+        logging.warning("Primary vision endpoint failed: %s", exc)
+        primary_error = str(exc)
+
+    if not PUTER_AUTH_TOKEN:
+        _set_runtime_state(provider=PRIMARY_VISION_PROVIDER, model=PRIMARY_VISION_MODEL, last_error=primary_error)
+        raise ValueError("Primary endpoint failed and PUTER_AUTH_TOKEN is not set.")
+
+    logging.warning("Falling back to Puter free tier: %s", PUTER_MODEL)
+    try:
+        response = fallback_client.chat.completions.create(
+            model=PUTER_MODEL,
+            messages=messages,
+            temperature=temperature,
+            timeout=max(timeout, 45),
+        )
+        _set_runtime_state(
+            provider="PUTER",
+            model=PUTER_MODEL,
+            last_error=f"Primary failed: {primary_error}",
+        )
+        return response
+    except Exception as exc:
+        combined_error = f"Primary failed: {primary_error}; Puter failed: {exc}"
+        _set_runtime_state(provider=PRIMARY_VISION_PROVIDER, model=PRIMARY_VISION_MODEL, last_error=combined_error)
+        raise RuntimeError(combined_error) from exc
+
+
+@app.get("/health")
+async def health():
+    state = get_runtime_state()
+    return JSONResponse({
+        "status": "ok",
+        "active_provider": state["active_provider"],
+        "active_model": state["active_model"],
+        "primary_base_url": state["primary_base_url"],
+        "fallback_enabled": state["fallback_enabled"],
+        "last_error": state["last_error"],
+    })
+
+
+@app.get("/runtime")
+async def runtime_info():
+    return await health()  # backward compat alias
+
+
+def infer_workspace_app(transcript_summary: str) -> str:
+    lowered = (transcript_summary or "").lower()
+    app_keywords = [
+        ("powerpoint", "PowerPoint"),
+        ("microsoft powerpoint", "PowerPoint"),
+        ("ms word", "Word"),
+        ("microsoft word", "Word"),
+        ("word document", "Word"),
+        ("excel", "Excel"),
+        ("microsoft excel", "Excel"),
+        ("notepad", "Notepad"),
+        ("visual studio code", "Visual Studio Code"),
+        ("vs code", "Visual Studio Code"),
+        ("vscode", "Visual Studio Code"),
+        ("pycharm", "PyCharm"),
+        ("intellij", "IntelliJ IDEA"),
+        ("android studio", "Android Studio"),
+        ("figma", "Figma"),
+        ("canva", "Canva"),
+        ("chrome devtools", "Developer Tools"),
+    ]
+    for needle, app_name in app_keywords:
+        if needle in lowered:
+            return app_name
+
+    coding_signals = ["python", "javascript", "typescript", "react", "fastapi", "api", "terminal", "code editor"]
+    if any(signal in lowered for signal in coding_signals):
+        return "Visual Studio Code"
+
+    return "Notepad"
+
+
+def _normalize_target_workspace(target_workspace: list[str] | str | None) -> list[str]:
+    if isinstance(target_workspace, str):
+        raw_items = [target_workspace]
+    else:
+        raw_items = list(target_workspace or [])
+    workspace_items = [
+        item
+        for item in (_normalize_workspace_item(entry) for entry in raw_items)
+        if item
+    ]
+    workspace_items = list(dict.fromkeys(workspace_items))
+    if "Browser" in workspace_items and len(workspace_items) > 1:
+        workspace_items = ["Browser"] + [item for item in workspace_items if item != "Browser"]
+    return workspace_items[:2]
+
+
+def _workspace_expected_state(workspace_items: list[str]) -> str:
+    if not workspace_items:
+        return "Required workspace is provisioned on the desktop."
+    if len(workspace_items) == 1:
+        return f"{workspace_items[0]} is open and maximized on the desktop."
+    return f"{workspace_items[0]} is snapped left and {workspace_items[1]} is open on the right side of the desktop."
+
+
+def _terminal_workspace_item(workspace_items: list[str]) -> str:
+    for item in workspace_items:
+        normalized = _normalize_workspace_item(item)
+        if normalized in {"Windows PowerShell", "Terminal", "Command Prompt"}:
+            return normalized
+    return ""
+
+
+def _append_bootstrap_cwd_actions(actions: list[dict], *, workspace_items: list[str], bootstrap_cwd: str) -> list[dict]:
+    bootstrap_cwd = str(bootstrap_cwd or "").strip()
+    if not bootstrap_cwd or not _terminal_workspace_item(workspace_items):
+        return actions
+    return list(actions) + [
+        {"type": "sleep", "duration": 1},
+        {"type": "type", "text": f'Set-Location -LiteralPath "{bootstrap_cwd}"', "press_enter": True},
+        {"type": "sleep", "duration": 1},
+    ]
+
+
+def build_workspace_setup_playbook(target_workspace: list[str] | str, bootstrap_cwd: str = ""):
+    workspace_items = _normalize_target_workspace(target_workspace)
+    if not workspace_items:
+        workspace_items = ["Windows PowerShell"]
+
+    reasoning = f"The next phase requires these workspace apps: {', '.join(workspace_items)}. Only provision the windows; do not act inside them yet."
+    expected_state = _workspace_expected_state(workspace_items)
+
+    if len(workspace_items) == 1:
+        app_name = workspace_items[0]
+        if app_name == "Browser":
+            actions = [{"type": "hotkey", "keys": ["win", "up"]}]
+        else:
+            actions = [
+                {"type": "hotkey", "keys": ["win"]},
+                {"type": "sleep", "duration": 1},
+                {"type": "type", "text": app_name, "press_enter": True},
+                {"type": "sleep", "duration": 5},
+                {"type": "hotkey", "keys": ["win", "up"]},
+            ]
+        actions = _append_bootstrap_cwd_actions(actions, workspace_items=workspace_items, bootstrap_cwd=bootstrap_cwd)
+        return {
+            "playbook": [
+                {
+                    "step_id": 0,
+                    "title": "workspace bootstrap",
+                    "intent": f"prepare focused workspace for {app_name}",
+                    "expected_tool": "gui",
+                    "original_command": "",
+                    "adapted_command": "",
+                    "safety_level": "green",
+                    "notes": "Phase 0 workspace bootstrap",
+                    "reasoning": reasoning,
+                    "target_app_name": "os",
+                    "actions": actions,
+                    "verification": {
+                        "expected_state": expected_state,
+                    },
+                }
+            ]
+        }
+
+    first_app, second_app = workspace_items[:2]
+    if first_app == "Browser":
+        actions = [
+            {"type": "hotkey", "keys": ["win", "left"]},
+            {"type": "sleep", "duration": 1},
+            {"type": "hotkey", "keys": ["win"]},
+            {"type": "sleep", "duration": 1},
+            {"type": "type", "text": second_app, "press_enter": True},
+            {"type": "sleep", "duration": 5},
+            {"type": "hotkey", "keys": ["win", "right"]},
+        ]
+    else:
+        actions = [
+            {"type": "hotkey", "keys": ["win"]},
+            {"type": "sleep", "duration": 1},
+            {"type": "type", "text": first_app, "press_enter": True},
+            {"type": "sleep", "duration": 5},
+            {"type": "hotkey", "keys": ["win", "left"]},
+            {"type": "sleep", "duration": 1},
+            {"type": "hotkey", "keys": ["win"]},
+            {"type": "sleep", "duration": 1},
+            {"type": "type", "text": second_app, "press_enter": True},
+            {"type": "sleep", "duration": 5},
+            {"type": "hotkey", "keys": ["win", "right"]},
+        ]
+    actions = _append_bootstrap_cwd_actions(actions, workspace_items=workspace_items, bootstrap_cwd=bootstrap_cwd)
+
+    return {
+        "playbook": [
+            {
+                "step_id": 0,
+                "title": "workspace bootstrap",
+                "intent": f"prepare split workspace for {first_app} and {second_app}",
+                "expected_tool": "gui",
+                "original_command": "",
+                "adapted_command": "",
+                "safety_level": "green",
+                "notes": "Phase 0 workspace bootstrap",
+                "reasoning": reasoning,
+                "target_app_name": "os",
+                "actions": actions,
+                "verification": {
+                    "expected_state": expected_state,
+                },
+            }
+        ]
+    }
+
+
+def validate_workspace_setup_playbook(payload: dict, target_workspace: list[str] | str, bootstrap_cwd: str = "") -> dict:
+    sanitized = validate_playbook_payload(payload)
+    steps = sanitized.get("playbook") or []
+    if len(steps) != 1:
+        raise ValueError("Workspace setup must contain exactly one bootstrap step.")
+
+    workspace_items = _normalize_target_workspace(target_workspace)
+    if not workspace_items:
+        raise ValueError("Workspace setup requires at least one target workspace item.")
+
+    step = steps[0]
+    actions = step.get("actions") or []
+    target_app = _normalize_app_name(step.get("target_app_name") or "")
+    if target_app not in {"os", ""}:
+        raise ValueError("Workspace setup must target the OS shell.")
+
+    step["target_app_name"] = "os"
+    if len(workspace_items) == 1:
+        app_name = workspace_items[0]
+        if app_name == "Browser":
+            if len(actions) != 1:
+                raise ValueError("Browser-only workspace setup must contain exactly one maximize action.")
+            action = actions[0]
+            if _canonical_action_type(action.get("type") or "") != "hotkey":
+                raise ValueError("Browser-only workspace setup must maximize the current browser window.")
+            keys = [str(key).strip().lower() for key in (action.get("keys") or []) if str(key).strip()]
+            if keys != ["win", "up"]:
+                raise ValueError(f"Browser-only workspace maximize must be ['win', 'up'], got {keys}.")
+        else:
+            if len(actions) < 5:
+                raise ValueError("Single-app workspace setup must contain at least five bootstrap actions.")
+            expected_sequence = [
+                ("hotkey", ["win"]),
+                ("sleep", None),
+                ("type", None),
+                ("sleep", None),
+                ("hotkey", ["win", "up"]),
+            ]
+            for index, (expected_type, expected_keys) in enumerate(expected_sequence):
+                action = actions[index]
+                action_type = _canonical_action_type(action.get("type") or "")
+                if action_type != expected_type:
+                    raise ValueError(f"Workspace setup action {index + 1} must be {expected_type}, got {action_type}.")
+                if expected_keys is not None:
+                    keys = [str(key).strip().lower() for key in (action.get("keys") or []) if str(key).strip()]
+                    if keys != expected_keys:
+                        raise ValueError(f"Workspace setup hotkey {index + 1} must be {expected_keys}, got {keys}.")
+            launch_text = str(actions[2].get("text") or "").strip()
+            if _normalize_workspace_item(launch_text) != app_name:
+                raise ValueError(f"Workspace setup must launch {app_name}, got {launch_text!r}.")
+    else:
+        first_app, second_app = workspace_items[:2]
+        if first_app == "Browser":
+            expected_sequence = [
+                ("hotkey", ["win", "left"]),
+                ("sleep", None),
+                ("hotkey", ["win"]),
+                ("sleep", None),
+                ("type", None),
+                ("sleep", None),
+                ("hotkey", ["win", "right"]),
+            ]
+            if len(actions) < len(expected_sequence):
+                raise ValueError("Browser + app workspace setup must contain at least seven actions.")
+            for index, (expected_type, expected_keys) in enumerate(expected_sequence):
+                action = actions[index]
+                action_type = _canonical_action_type(action.get("type") or "")
+                if action_type != expected_type:
+                    raise ValueError(f"Workspace setup action {index + 1} must be {expected_type}, got {action_type}.")
+                if expected_keys is not None:
+                    keys = [str(key).strip().lower() for key in (action.get("keys") or []) if str(key).strip()]
+                    if keys != expected_keys:
+                        raise ValueError(f"Workspace setup hotkey {index + 1} must be {expected_keys}, got {keys}.")
+            launch_text = str(actions[4].get("text") or "").strip()
+            if _normalize_workspace_item(launch_text) != second_app:
+                raise ValueError(f"Workspace setup must launch {second_app}, got {launch_text!r}.")
+        else:
+            expected_sequence = [
+                ("hotkey", ["win"]),
+                ("sleep", None),
+                ("type", None),
+                ("sleep", None),
+                ("hotkey", ["win", "left"]),
+                ("sleep", None),
+                ("hotkey", ["win"]),
+                ("sleep", None),
+                ("type", None),
+                ("sleep", None),
+                ("hotkey", ["win", "right"]),
+            ]
+            if len(actions) < len(expected_sequence):
+                raise ValueError("Two-app workspace setup must contain at least eleven actions.")
+            for index, (expected_type, expected_keys) in enumerate(expected_sequence):
+                action = actions[index]
+                action_type = _canonical_action_type(action.get("type") or "")
+                if action_type != expected_type:
+                    raise ValueError(f"Workspace setup action {index + 1} must be {expected_type}, got {action_type}.")
+                if expected_keys is not None:
+                    keys = [str(key).strip().lower() for key in (action.get("keys") or []) if str(key).strip()]
+                    if keys != expected_keys:
+                        raise ValueError(f"Workspace setup hotkey {index + 1} must be {expected_keys}, got {keys}.")
+            first_launch_text = str(actions[2].get("text") or "").strip()
+            second_launch_text = str(actions[8].get("text") or "").strip()
+            if _normalize_workspace_item(first_launch_text) != first_app:
+                raise ValueError(f"Workspace setup must launch {first_app}, got {first_launch_text!r}.")
+            if _normalize_workspace_item(second_launch_text) != second_app:
+                raise ValueError(f"Workspace setup must launch {second_app}, got {second_launch_text!r}.")
+
+    normalized_bootstrap_cwd = str(bootstrap_cwd or "").strip()
+    if normalized_bootstrap_cwd and _terminal_workspace_item(workspace_items):
+        joined = " ".join(str(action.get("text") or "") for action in actions)
+        if "Set-Location -LiteralPath" not in joined:
+            raise ValueError("Workspace setup must set the terminal working directory before the temporal loop begins.")
+
+    step["verification"] = {
+        "expected_state": _workspace_expected_state(workspace_items)
+    }
+    return {"playbook": [step]}
+
+
+def _format_seconds_to_timecode(seconds: int | float) -> str:
+    total_seconds = max(0, int(float(seconds or 0)))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    remaining = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+
+
+def _parse_timecode_to_seconds(value) -> int:
+    if isinstance(value, (int, float)):
+        return max(0, int(float(value)))
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Phase timecode is required.")
+    if text.replace(".", "", 1).isdigit():
+        return max(0, int(float(text)))
+    parts = text.split(":")
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return max(0, int(float(hours) * 3600 + float(minutes) * 60 + float(seconds)))
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return max(0, int(float(minutes) * 60 + float(seconds)))
+    raise ValueError(f"Unsupported phase timecode: {value}")
+
+
+def _normalize_phase_focus(value: str) -> str:
+    normalized = " ".join(str(value or "").strip().lower().split())
+    if not normalized:
+        return ""
+    if normalized in {"terminal", "shell", "cli", "powershell", "command prompt", "cmd"}:
+        return "Windows PowerShell"
+    if normalized in {"editor", "code editor", "visual studio code", "vs code", "vscode"}:
+        return "Visual Studio Code"
+    if normalized in {"browser", "web browser", "chrome", "edge", "firefox"}:
+        return "Browser"
+    return str(value or "").strip()
+
+
+def _allowed_actions_for_focus(focus: str) -> list[str]:
+    normalized = _normalize_phase_focus(focus)
+    if normalized == "Windows PowerShell":
+        return ["keyboard_input", "hotkey", "click", "sleep"]
+    if normalized == "Visual Studio Code":
+        return ["keyboard_input", "hotkey", "click", "sleep"]
+    return ["click", "keyboard_input", "hotkey", "sleep"]
+
+
+def _normalize_workspace_item(value: str) -> str:
+    normalized = _normalize_phase_focus(value)
+    if normalized:
+        return normalized
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"browser", "chrome", "google chrome", "edge", "firefox"}:
+        return "Browser"
+    return text
+
+_GENERIC_PHASE_PATTERNS = [
+    r"^phase\s*\d+\b",
+    r"^step\s*\d+\b",
+    r"^screen interaction\b",
+    r"^screen activity\b",
+    r"^terminal activity\b",
+    r"^browser activity\b",
+    r"^editor activity\b",
+    r"^visual studio code activity\b",
+    r"^code typing\b",
+    r"^typing code\b",
+    r"^application work\b",
+    r"^work in (the )?(terminal|browser|editor)\b",
+]
+
+
+def _normalize_phase_description(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _phase_description_is_generic(description: str) -> bool:
+    normalized = _normalize_phase_description(description).lower()
+    if not normalized:
+        return True
+    if re.fullmatch(r"(terminal|browser|editor|screen)( [0-9:.\-]+)?", normalized):
+        return True
+    return any(re.match(pattern, normalized) for pattern in _GENERIC_PHASE_PATTERNS)
+
+
+def _phase_intent_haystack(*parts) -> str:
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _looks_like_code_authoring(description: str, focus: str, raw_phase: dict, required_workspace: list[str] | None = None) -> bool:
+    haystack = _phase_intent_haystack(
+        description,
+        focus,
+        raw_phase.get("phase_mode"),
+        raw_phase.get("verification_mode"),
+        " ".join(raw_phase.get("success_signals") or []),
+        " ".join(raw_phase.get("failure_signals") or []),
+        " ".join(raw_phase.get("allowed_actions") or []),
+        " ".join(required_workspace or []),
+    )
+    code_markers = (
+        "bootstrap",
+        "application bootstrap",
+        "write code",
+        "coding",
+        "implementation",
+        "logic",
+        "fastapi app",
+        "from fastapi import",
+        "app = fastapi",
+        "@app.get",
+        "visual studio code",
+        "vscode",
+        "editor",
+        "main.py",
+    )
+    if any(marker in haystack for marker in code_markers):
+        return True
+    workspace = {str(item).strip().lower() for item in (required_workspace or []) if str(item).strip()}
+    if "visual studio code" in workspace and "browser" not in str(focus or "").strip().lower():
+        if any(token in haystack for token in ("fastapi", "python", "code", "app")):
+            return True
+    return False
+
+
+def _looks_like_browser_verification(description: str, focus: str, raw_phase: dict) -> bool:
+    haystack = _phase_intent_haystack(
+        description,
+        focus,
+        raw_phase.get("phase_mode"),
+        raw_phase.get("verification_mode"),
+        " ".join(raw_phase.get("success_signals") or []),
+        " ".join(raw_phase.get("failure_signals") or []),
+        " ".join(raw_phase.get("required_workspace") or []),
+    )
+    browser_markers = (
+        "swagger",
+        "try it out",
+        "successful response",
+        "response body",
+        "default route",
+        "hello world",
+        "localhost",
+        "127.0.0.1",
+        "browser",
+        "api verification",
+        "verify result",
+        "preview",
+    )
+    return any(marker in haystack for marker in browser_markers)
+
+
+def _infer_phase_mode(description: str, focus: str, required_workspace: list[str], raw_phase: dict) -> str:
+    explicit = str(raw_phase.get("phase_mode") or "").strip().lower()
+    if _looks_like_code_authoring(description, focus, raw_phase, required_workspace):
+        return "type_code"
+    if explicit and explicit == "type_code" and _looks_like_browser_verification(description, focus, raw_phase):
+        explicit = "browser_verify"
+    if explicit:
+        return explicit
+    haystack = _phase_intent_haystack(
+        description,
+        focus,
+        " ".join(required_workspace),
+        " ".join(raw_phase.get("allowed_actions") or []),
+    )
+    if _looks_like_browser_verification(description, focus, raw_phase):
+        return "browser_verify"
+    if focus == "Windows PowerShell":
+        if any(token in haystack for token in ("install", "dependency", "dependencies", "setup", "environment", "venv", "conda", "pip")):
+            return "terminal_install"
+        if any(token in haystack for token in ("run", "server", "uvicorn", "localhost", "127.0.0.1", "start app", "launch")):
+            return "terminal_run"
+    if focus == "Visual Studio Code":
+        return "type_code"
+    if focus == "Browser" and any(token in haystack for token in ("verify", "preview", "browser", "docs", "swagger", "result", "localhost", "127.0.0.1", "api")):
+        return "browser_verify"
+    return ""
+
+
+def _infer_strict_action_type(phase_mode: str, focus: str, raw_phase: dict) -> str:
+    explicit = str(raw_phase.get("strict_action_type") or "").strip()
+    if phase_mode == "browser_verify":
+        return ""
+    if explicit and explicit.lower() in {"keyboard_input", "type", "click", "hotkey"}:
+        return explicit
+    if phase_mode in {"terminal_install", "terminal_run", "type_code"}:
+        return "keyboard_input"
+    return ""
+
+
+def _infer_verification_mode(phase_mode: str, focus: str, raw_phase: dict) -> str:
+    explicit = str(raw_phase.get("verification_mode") or "").strip().lower()
+    if explicit in _ALLOWED_VERIFICATION_MODES:
+        if phase_mode == "type_code" and explicit == "vision_state":
+            return "ocr_focus"
+        return explicit
+    if phase_mode == "type_code":
+        return "ocr_focus"
+    if phase_mode in {"terminal_install", "terminal_run"}:
+        return "ocr_focus"
+    if focus == "Browser":
+        return "vision_state"
+    return "vision_state"
+
+
+def _default_success_signals(phase_mode: str, description: str, focus: str) -> list[str]:
+    lowered = description.lower()
+    if phase_mode == "terminal_install":
+        signals = ["installed", "collecting", "installing", "requirement already satisfied"]
+        if "fastapi" in lowered:
+            signals.insert(0, "fastapi")
+        if "uvicorn" in lowered:
+            signals.insert(0, "uvicorn")
+        return list(dict.fromkeys(signals))
+    if phase_mode == "terminal_run":
+        return ["uvicorn", "running on", "localhost", "127.0.0.1"]
+    if phase_mode == "type_code":
+        if "fastapi" in lowered:
+            return ["from fastapi import fastapi", "app = fastapi()"]
+        if "endpoint" in lowered:
+            return ["@app.get", "def "]
+        return ["import ", "def "]
+    if focus == "Browser":
+        return ["localhost", "127.0.0.1", "swagger ui", "fastapi"]
+    return []
+
+
+def _default_failure_signals(phase_mode: str, focus: str) -> list[str]:
+    base = ["error", "traceback", "command not found", "modulenotfounderror"]
+    if phase_mode == "type_code":
+        return ["untitled", "Untitled"]
+    if focus == "Browser":
+        return ["not found", "cannot reach", "failed", "error"]
+    return base
+
+
+def _normalize_type_code_failure_signals(signals: list[str]) -> list[str]:
+    normalized = {re.sub(r"\s+", "", str(item or "").strip().lower()) for item in signals if str(item or "").strip()}
+    runtime_errors = {"syntaxerror", "nameerror", "indentationerror", "traceback", "modulenotfounderror"}
+    if normalized and normalized.issubset(runtime_errors):
+        return ["untitled", "Untitled"]
+    filtered = [
+        str(item).strip()
+        for item in signals
+        if str(item).strip()
+        and re.sub(r"\s+", "", str(item).strip().lower()) not in runtime_errors
+        and str(item).strip().lower() not in {"error", "failed", "failure", "server error"}
+    ]
+    if not filtered:
+        return ["untitled", "Untitled"]
+    if any(str(item).strip().lower() == "untitled" for item in filtered):
+        return ["untitled", "Untitled"]
+    return filtered[:8]
+
+
+def _normalize_phase_signal_list(value, *, fallback: list[str]) -> list[str]:
+    if value is None:
+        value = fallback
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        value = fallback
+    normalized = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            normalized.append(text)
+    return normalized[:8]
+
+
+def validate_proposal_manifest(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Proposal payload must be a JSON object.")
+    phases = payload.get("phases")
+    if not isinstance(phases, list) or not (3 <= len(phases) <= 5):
+        raise ValueError("Proposal must include 3 to 5 phases.")
+    dependencies_raw = payload.get("dependencies") or {}
+    if not isinstance(dependencies_raw, dict):
+        raise ValueError("Proposal dependencies must be an object when provided.")
+    apps_raw = dependencies_raw.get("apps") or []
+    if apps_raw is None:
+        apps_raw = []
+    if not isinstance(apps_raw, list):
+        raise ValueError("Proposal dependencies.apps must be an array when provided.")
+    sanitized_apps: list[dict] = []
+    for index, app in enumerate(apps_raw, start=1):
+        if isinstance(app, str):
+            name = str(app).strip()
+            if not name:
+                raise ValueError(f"Proposal dependencies.apps[{index}] must not be empty.")
+            sanitized_apps.append({"name": name})
+            continue
+        if not isinstance(app, dict):
+            raise ValueError(f"Proposal dependencies.apps[{index}] must be a string or object.")
+        name = str(app.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"Proposal dependencies.apps[{index}].name is required.")
+        sanitized_app = {"name": name}
+        probe = str(app.get("probe") or "").strip()
+        if probe:
+            sanitized_app["probe"] = probe
+        version_args = app.get("version_args")
+        if version_args is not None:
+            if not isinstance(version_args, list):
+                raise ValueError(
+                    f"Proposal dependencies.apps[{index}].version_args must be an array when provided."
+                )
+            sanitized_app["version_args"] = [str(item).strip() for item in version_args if str(item).strip()]
+        if app.get("skip") is not None:
+            sanitized_app["skip"] = bool(app.get("skip"))
+        sanitized_apps.append(sanitized_app)
+
+    local_tutorial_path = str(payload.get("local_tutorial_path") or "").strip()
+    expected_environment = str(payload.get("expected_environment") or "").strip()
+    demo_name = str(payload.get("demo_name") or "Mimiq_Autonomous_Draft").strip()
+
+    sanitized_phases: list[dict] = []
+    last_second = -1
+    for index, raw_phase in enumerate(phases, start=1):
+        if not isinstance(raw_phase, dict):
+            raise ValueError(f"Phase {index} must be a JSON object.")
+        description = _normalize_phase_description(raw_phase.get("description") or "")
+        if not description:
+            raise ValueError(f"Phase {index} is missing description.")
+        if _phase_description_is_generic(description):
+            raise ValueError(
+                f"Phase {index} has a generic description: {description!r}. "
+                "Infer the phase intent from OCR and visual evidence."
+            )
+        focus = _normalize_phase_focus(raw_phase.get("expected_focus") or raw_phase.get("focus") or "")
+        if not focus:
+            raise ValueError(f"Phase {index} is missing expected_focus.")
+        seconds = _parse_timecode_to_seconds(raw_phase.get("timecode"))
+        if seconds <= last_second:
+            raise ValueError("Proposal phases must be sorted by ascending timecode.")
+        last_second = seconds
+        allowed_actions = raw_phase.get("allowed_actions") or _allowed_actions_for_focus(focus)
+        if not isinstance(allowed_actions, list) or not allowed_actions:
+            raise ValueError(f"Phase {index} must include allowed_actions.")
+        required_workspace_raw = raw_phase.get("required_workspace") or []
+        if required_workspace_raw is None:
+            required_workspace_raw = []
+        if not isinstance(required_workspace_raw, list):
+            raise ValueError(f"Phase {index}.required_workspace must be an array when provided.")
+        required_workspace = [
+            item
+            for item in (_normalize_workspace_item(entry) for entry in required_workspace_raw)
+            if item
+        ]
+        if not required_workspace:
+            required_workspace = [focus]
+        required_workspace = list(dict.fromkeys(required_workspace))
+        if _looks_like_code_authoring(description, focus, raw_phase, required_workspace):
+            focus = "Visual Studio Code"
+            if "Visual Studio Code" not in required_workspace:
+                required_workspace.append("Visual Studio Code")
+            if "Browser" in required_workspace:
+                required_workspace = ["Browser"] + [item for item in required_workspace if item != "Browser"]
+        phase_mode = _infer_phase_mode(description, focus, required_workspace, raw_phase)
+        file_target = str(raw_phase.get("file_target") or "").strip()
+        if phase_mode == "type_code" and not file_target:
+            file_target = "main.py"
+        if phase_mode == "browser_verify":
+            focus = "Browser"
+            required_workspace = [item for item in required_workspace if item != "Browser"]
+            required_workspace.insert(0, "Browser")
+        strict_action_type = _infer_strict_action_type(phase_mode, focus, raw_phase)
+        verification_mode = _infer_verification_mode(phase_mode, focus, raw_phase)
+        success_signals = _normalize_phase_signal_list(
+            raw_phase.get("success_signals"),
+            fallback=_default_success_signals(phase_mode, description, focus),
+        )
+        failure_signals = _normalize_phase_signal_list(
+            raw_phase.get("failure_signals"),
+            fallback=_default_failure_signals(phase_mode, focus),
+        )
+        if phase_mode == "type_code":
+            failure_signals = _normalize_type_code_failure_signals(failure_signals)
+        sanitized_phases.append(
+            {
+                "phase_id": int(raw_phase.get("phase_id") or index),
+                "timecode": _format_seconds_to_timecode(seconds),
+                "description": description,
+                "expected_focus": focus,
+                "required_workspace": required_workspace,
+                "confidence_score": round(
+                    max(0.0, min(1.0, float(raw_phase.get("confidence_score", 0.5)))),
+                    2,
+                ),
+                "allowed_actions": [str(action).strip() for action in allowed_actions if str(action).strip()],
+                "phase_mode": phase_mode,
+                "file_target": file_target,
+                "strict_action_type": strict_action_type,
+                "verification_mode": verification_mode,
+                "success_signals": success_signals,
+                "failure_signals": failure_signals,
+            }
+        )
+
+    return {
+        "demo_name": demo_name,
+        "local_tutorial_path": local_tutorial_path,
+        "expected_environment": expected_environment,
+        "dependencies": {"apps": sanitized_apps} if sanitized_apps else {},
+        "execution_rules": {
+            "max_retries": 1,
+            "allowed_actions": ["click", "keyboard_input", "hotkey", "sleep"],
+        },
+        "phases": sanitized_phases,
+    }
+
+_ALLOWED_PLAYBOOK_ACTIONS = {"click", "type", "keyboard_input", "hotkey", "sleep"}
+_ALLOWED_VERIFICATION_MODES = {"vision_state", "terminal_output", "ocr_focus", "pixel_diff"}
+_SAFE_PLAYBOOK_KEYS = {
+    "step_id", "title", "intent", "expected_tool", "original_command",
+    "adapted_command", "safety_level", "notes", "reasoning",
+    "target_app_name", "actions", "verification",
+}
+_SAVE_MARKERS = (
+    "save as", "save file", "save the file", "save menu",
+    "save button", "file > save", "file>save",
+)
+
+
+def _coerce_int(value) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid coordinate.")
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Coordinate must be numeric, got {value!r}.") from exc
+    if not math.isfinite(number):
+        raise ValueError("Coordinate must be finite.")
+    return int(number)
+
+
+def _normalize_keys(raw_keys) -> list[str]:
+    if isinstance(raw_keys, str):
+        raw_keys = [part.strip() for part in raw_keys.split("+") if part.strip()]
+    if not isinstance(raw_keys, list):
+        raise ValueError("Hotkey payload must contain a keys list.")
+    normalized = [str(key).strip().lower() for key in raw_keys if str(key).strip()]
+    if not normalized:
+        raise ValueError("Hotkey payload must contain at least one key.")
+    return normalized
+
+
+def _canonical_action_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "keyboard_input":
+        return "type"
+    return normalized
+
+
+def _is_save_action(action: dict) -> bool:
+    normalized_type = str(action.get("type") or "").strip().lower()
+    text_bits = [
+        action.get("target_description"), action.get("intent"),
+        action.get("reasoning"), action.get("text"), action.get("value"),
+    ]
+    haystack = " ".join(str(bit or "") for bit in text_bits).lower()
+    if any(marker in haystack for marker in _SAVE_MARKERS):
+        return True
+    if normalized_type in {"hotkey", "keyboard_input", "type"}:
+        try:
+            keys = _normalize_keys(action.get("keys") or action.get("sequence") or [])
+        except ValueError:
+            keys = []
+        if "ctrl" in keys and "s" in keys:
+            return True
+        normalized_text = str(action.get("text") or action.get("value") or "").lower().replace(" ", "")
+        if normalized_text in {"ctrl+s", "ctrl-s", "ctrls", "ctrl+shift+s", "ctrl-shift-s", "ctrlshifts"}:
+            return True
+    return False
+
+
+def _sanitize_action(action: dict) -> dict:
+    if not isinstance(action, dict):
+        raise ValueError("Each action must be a JSON object.")
+    if _is_save_action(action):
+        return {"type": "hotkey", "keys": ["ctrl", "shift", "s"]}
+    action_type = _canonical_action_type(action.get("type") or "")
+    if action_type == "verification":
+        raise ValueError("Unsupported action type from model: verification")
+    if action_type not in _ALLOWED_PLAYBOOK_ACTIONS:
+        raise ValueError(f"Unsupported action type from model: {action.get('type')}")
+    if action_type == "click":
+        coords = action.get("coordinates")
+        if not isinstance(coords, list) or len(coords) not in {2, 4}:
+            raise ValueError("Click actions must include a coordinate array of length 2 or 4.")
+        return {
+            "type": "click",
+            "target_description": str(action.get("target_description") or "target").strip() or "target",
+            "coordinates": [_coerce_int(value) for value in coords],
+        }
+    if action_type == "type":
+        text_value = action.get("text")
+        if text_value is None:
+            text_value = action.get("value", "")
+        text_value = str(text_value).strip()
+        if not text_value:
+            raise ValueError("Type actions must include non-empty text.")
+        sanitized = {"type": "type", "text": text_value}
+        if action.get("press_enter"):
+            sanitized["press_enter"] = True
+        return sanitized
+    if action_type == "sleep":
+        seconds = float(action.get("seconds") or action.get("duration") or 1)
+        seconds = max(0.0, min(seconds, 30.0))
+        return {"type": "sleep", "duration": seconds}
+    keys = _normalize_keys(action.get("keys") or action.get("sequence") or [])
+    if "ctrl" in keys and "s" in keys:
+        keys = ["ctrl", "shift", "s"]
+    return {"type": "hotkey", "keys": keys}
+
+
+def _normalize_signal_list(raw_value) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        raw_value = [raw_value]
+    if not isinstance(raw_value, list):
+        raise ValueError("Verification signals must be an array of strings.")
+    normalized = []
+    for item in raw_value:
+        text = str(item or "").strip()
+        if text:
+            normalized.append(text)
+    return normalized[:8]
+
+
+def _sanitize_verification(verification: dict) -> dict:
+    if verification is None:
+        verification = {}
+    if not isinstance(verification, dict):
+        raise ValueError("Verification block must be a JSON object.")
+    expected_state = str(verification.get("expected_state") or "").strip()
+    expected_visual_state = str(verification.get("expected_visual_state") or expected_state).strip()
+    focus = str(verification.get("focus") or "").strip()
+    success_signals = _normalize_signal_list(verification.get("success_signals"))
+    failure_signals = _normalize_signal_list(verification.get("failure_signals"))
+    verification_mode = str(verification.get("verification_mode") or "").strip().lower()
+    if verification_mode and verification_mode not in _ALLOWED_VERIFICATION_MODES:
+        raise ValueError(f"Unsupported verification_mode: {verification_mode}")
+    if not verification_mode:
+        verification_mode = "vision_state"
+    if not expected_visual_state and not expected_state and not success_signals:
+        raise ValueError("Verification block must describe the expected outcome.")
+    return {
+        "expected_state": expected_state or expected_visual_state,
+        "expected_visual_state": expected_visual_state or expected_state,
+        "focus": focus,
+        "success_signals": success_signals,
+        "failure_signals": failure_signals,
+        "verification_mode": verification_mode,
+    }
+
+
+def validate_playbook_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Playbook payload must be a JSON object.")
+    steps = payload.get("playbook")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Playbook payload must include a non-empty playbook array.")
+    sanitized_steps: list[dict] = []
+    for index, raw_step in enumerate(steps, start=1):
+        if not isinstance(raw_step, dict):
+            raise ValueError(f"Step {index} is not a JSON object.")
+        actions = raw_step.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError(f"Step {index} must include at least one action.")
+        sanitized_step = {
+            key: raw_step[key]
+            for key in _SAFE_PLAYBOOK_KEYS
+            if key in raw_step and key not in {"actions", "verification"}
+        }
+        sanitized_step["actions"] = [_sanitize_action(action) for action in actions]
+        sanitized_step["verification"] = _sanitize_verification(raw_step.get("verification"))
+        sanitized_steps.append(sanitized_step)
+    return {"playbook": sanitized_steps}
+
+
+def _normalize_app_name(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _looks_like_shell_text(value: str) -> bool:
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return False
+    shell_markers = (
+        "conda ", "pip install", "npm ", "uvicorn ", "python ",
+        "python3 ", "powershell", "cmd.exe", "terminal", "console",
+        "new-item ", "mkdir ", "cd ", "\\:\\\\users\\\\",
+    )
+    return any(marker in lowered for marker in shell_markers)
+
+
+def _phase_requires_terminal_command(phase_contract: dict | None) -> bool:
+    if not phase_contract:
+        return False
+    phase_mode = str(phase_contract.get("phase_mode") or "").strip().lower()
+    if phase_mode in {"terminal_install", "terminal_run"}:
+        return True
+    target_app = _normalize_app_name(phase_contract.get("expected_target_app_name") or "")
+    if target_app not in {"windows powershell", "command prompt", "terminal", "shell", "cmd"}:
+        return False
+    haystack = " ".join(
+        str(part or "")
+        for part in (
+            phase_contract.get("phase_description"),
+            phase_contract.get("expected_environment"),
+            phase_mode,
+        )
+    ).lower()
+    command_markers = (
+        "install", "dependency", "dependencies", "environment", "setup",
+        "server", "run ", "launch", "uvicorn", "pip", "conda",
+        "activate", "python -m",
+    )
+    return any(marker in haystack for marker in command_markers)
+
+
+def _allowed_target_apps_for_phase(phase_contract: dict | None) -> set[str]:
+    if not phase_contract:
+        return set()
+    phase_mode = str(phase_contract.get("phase_mode") or "").strip().lower()
+    allowed: set[str] = set()
+    expected_target = _normalize_app_name(phase_contract.get("expected_target_app_name") or "")
+    if phase_mode in {"terminal_install", "terminal_run", "type_code", "save_file", "browser_verify", "browser_navigate"} and expected_target:
+        return {expected_target}
+    for item in (phase_contract.get("required_workspace") or []):
+        normalized = _normalize_app_name(item)
+        if normalized:
+            allowed.add(normalized)
+    if expected_target:
+        allowed.add(expected_target)
+    return allowed
+
+
+def validate_phase_contract_payload(payload: dict, phase_contract: dict | None) -> dict:
+    if not phase_contract:
+        return payload
+
+    steps = payload.get("playbook") or []
+    if not steps:
+        raise ValueError("Phase contract requires a non-empty playbook.")
+
+    strict_action_type = str(phase_contract.get("strict_action_type") or "").strip().lower()
+    phase_mode = str(phase_contract.get("phase_mode") or "").strip().lower()
+    expected_target_app = _normalize_app_name(phase_contract.get("expected_target_app_name") or "")
+    allowed_action_types = {
+        _canonical_action_type(item)
+        for item in (phase_contract.get("allowed_action_types") or [])
+        if str(item).strip()
+    }
+    allowed_target_apps = _allowed_target_apps_for_phase(phase_contract)
+    strict_action_type = _canonical_action_type(strict_action_type)
+    terminal_command_required = _phase_requires_terminal_command(phase_contract)
+
+    def _is_allowed_support_action(action: dict) -> bool:
+        action_type = _canonical_action_type(action.get("type") or "")
+        if action_type == "sleep":
+            return True
+        if action_type == "hotkey":
+            try:
+                keys = _normalize_keys(action.get("keys") or action.get("sequence") or [])
+            except ValueError:
+                return False
+            if terminal_command_required and keys == ["enter"]:
+                return True
+            if phase_mode in {"type_code", "save_file"} and "ctrl" in keys and "s" in keys:
+                return True
+            if phase_mode == "type_code" and keys in (["ctrl", "n"], ["ctrl", "a"], ["delete"], ["ctrl", "shift", "s"]):
+                return True
+        return False
+
+    has_phase_primary_action = False
+    if strict_action_type:
+        for step in steps:
+            actions = step.get("actions") or []
+            for action in actions:
+                action_type = _canonical_action_type(action.get("type") or "")
+                if action_type == strict_action_type and not _is_allowed_support_action(action):
+                    has_phase_primary_action = True
+                    break
+            if has_phase_primary_action:
+                break
+
+    for index, step in enumerate(steps, start=1):
+        step_target = _normalize_app_name(step.get("target_app_name") or "")
+        if allowed_target_apps and step_target and step_target not in allowed_target_apps:
+            raise ValueError(
+                f"Target Drift Detected: Model attempted to target '{step.get('target_app_name')}', "
+                f"but Phase Contract only allows {sorted(allowed_target_apps)}."
+            )
+        if expected_target_app and step_target and step_target != expected_target_app:
+            raise ValueError(
+                f"Step {index} targets '{step.get('target_app_name')}', expected '{phase_contract.get('expected_target_app_name')}'."
+            )
+        if phase_mode == "type_code":
+            step_target_raw = str(step.get("target_app_name") or "").strip().lower()
+            if any(token in step_target_raw for token in ("browser", "firefox", "chrome")):
+                raise ValueError(
+                    f"type_code phase cannot target Browser (got '{step.get('target_app_name')}'). "
+                    "Target must be Visual Studio Code."
+                )
+
+        actions = step.get("actions") or []
+        non_sleep_actions = [action for action in actions if str(action.get("type") or "").strip().lower() != "sleep"]
+        non_sleep_types = [_canonical_action_type(action.get("type") or "") for action in non_sleep_actions]
+        if strict_action_type:
+            if not non_sleep_actions:
+                raise ValueError(f"Step {index} must contain a '{strict_action_type}' action.")
+            primary_actions = [action for action in non_sleep_actions if not _is_allowed_support_action(action)]
+            if not primary_actions:
+                if not has_phase_primary_action:
+                    raise ValueError(f"Step {index} must contain a primary '{strict_action_type}' action.")
+            elif any(_canonical_action_type(action.get("type") or "") != strict_action_type for action in primary_actions):
+                raise ValueError(f"Step {index} violates the strict phase action type '{strict_action_type}'.")
+
+        if allowed_action_types:
+            for action in actions:
+                action_type = _canonical_action_type(action.get("type") or "")
+                if action_type not in allowed_action_types:
+                    raise ValueError(f"Action type '{action_type}' is outside the demo allow-list.")
+
+        verification = step.get("verification") or {}
+        verification_focus = _normalize_app_name(verification.get("focus") or "")
+        if expected_target_app and verification_focus and verification_focus != expected_target_app:
+            raise ValueError(
+                f"Verification focus '{verification.get('focus')}' does not match expected '{phase_contract.get('expected_target_app_name')}'."
+            )
+
+        if terminal_command_required:
+            typed_segments = []
+            for action in non_sleep_actions:
+                if _canonical_action_type(action.get("type") or "") == "type":
+                    typed_segments.append(str(action.get("text") or action.get("value") or ""))
+            typed_text = "\n".join(segment for segment in typed_segments if segment).strip()
+            if "type" not in non_sleep_types or not typed_text:
+                raise ValueError(
+                    "Terminal command phase requires a keyboard_input/type action with concrete command text; focus clicks alone are not allowed."
+                )
+            if not _looks_like_shell_text(typed_text):
+                raise ValueError(
+                    "Terminal command phase must emit concrete shell command text such as pip, conda, python, or uvicorn."
+                )
+
+        combined_step_text = " ".join(
+            str(part or "")
+            for part in (step.get("title"), step.get("intent"), step.get("reasoning"), step.get("notes"))
+        ).lower()
+
+        if phase_mode == "type_code":
+            typed_segments = []
+            for action in non_sleep_actions:
+                if _canonical_action_type(action.get("type") or "") == "type":
+                    typed_segments.append(str(action.get("text") or action.get("value") or ""))
+            typed_text = "\n".join(segment for segment in typed_segments if segment)
+            if not typed_text.strip():
+                if has_phase_primary_action:
+                    continue
+                raise ValueError("Code-entry phase requires keyboard_input text.")
+            if _looks_like_shell_text(typed_text) or any(
+                token in combined_step_text for token in ("browser console", "terminal", "powershell", "command prompt")
+            ):
+                raise ValueError("Code-entry phase produced shell or browser-console content.")
+
+        if phase_mode == "save_file":
+            hotkeys = []
+            for action in non_sleep_actions:
+                if str(action.get("type") or "").strip().lower() == "hotkey":
+                    keys = action.get("keys") or action.get("sequence") or []
+                    if isinstance(keys, str):
+                        keys = [part.strip() for part in keys.split("+") if part.strip()]
+                    hotkeys.append([str(key).strip().lower() for key in keys if str(key).strip()])
+            if not any("ctrl" in keys and "s" in keys for keys in hotkeys):
+                raise ValueError("Save phase requires a Ctrl+S style hotkey.")
+
+    return payload
+
+
+def bulletproof_json(raw_text):
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start == -1:
+        return None
+    repaired_str = repair_json(raw_text[start:end + 1 if end != -1 else None])
+    try:
+        return json.loads(repaired_str)
+    except Exception:
+        return None
+
+
+def _translate_playbook_coordinates_to_full_desktop(payload: dict, crop_bbox: tuple[int, int, int, int] | None) -> dict:
+    if not crop_bbox or not isinstance(payload, dict):
+        return payload
+    offset_x, offset_y = int(crop_bbox[0]), int(crop_bbox[1])
+    for step in payload.get("playbook") or []:
+        if not isinstance(step, dict):
+            continue
+        for action in step.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            if _canonical_action_type(action.get("type") or "") != "click":
+                continue
+            coords = action.get("coordinates")
+            if not isinstance(coords, list):
+                continue
+            if len(coords) == 2:
+                action["coordinates"] = [int(coords[0]) + offset_x, int(coords[1]) + offset_y]
+            elif len(coords) == 4:
+                action["coordinates"] = [
+                    int(coords[0]) + offset_x, int(coords[1]) + offset_y,
+                    int(coords[2]) + offset_x, int(coords[3]) + offset_y,
+                ]
+    return payload
+
+
+@app.get("/semantic")
+async def get_semantic(request: Request):
+    print("\n[*] Routing semantic sampler payload...")
+    try:
+        response = create_completion(
+            [{"role": "user", "content": "Analyze this video context and return ONLY a JSON object with a 'high_intent_timestamps' key containing an array of strings. No markdown."}]
+        )
+        raw_text = response.choices[0].message.content
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return {"error": "LLM failed to output JSON."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/setup")
+async def get_setup(req: SetupRequest):
+    print("\n[*] Routing workspace bootstrap payload to vision runtime...")
+    transcript_summary = (req.transcript_summary or "").strip()
+    target_workspace = _normalize_target_workspace(req.target_workspace)
+    bootstrap_cwd = str(req.bootstrap_cwd or "").strip()
+    if not target_workspace:
+        target_workspace = [_normalize_workspace_item(infer_workspace_app(transcript_summary))]
+    target_workspace_json = json.dumps(target_workspace, ensure_ascii=False)
+
+    prompt_template = """
+You are an Environment Setup Agent.
+Your objective is to execute OS-level bootstrap actions to prepare the required workspace on Windows.
+The requested workspace is:
+__TARGET_WORKSPACE__
+
+Rules:
+- Treat target_workspace as the source of truth. Do not infer a different app.
+- Only provision windows. Do not click inside the apps, type tutorial commands, or interact with any in-app UI.
+- The tutorial browser has already been launched to local media. If Browser appears in target_workspace, manage that existing browser window instead of launching a website.
+- If target_workspace includes a terminal and bootstrap_cwd is provided, you MUST set the terminal working directory to bootstrap_cwd before finishing setup.
+- If target_workspace contains one app:
+  - If it is Browser, maximize the current browser window using win + up.
+  - Otherwise open it using win, type the exact app name, press Enter, wait, then maximize it with win + up.
+- If target_workspace contains two apps:
+  - If the first app is Browser, snap the current browser left with win + left, then open the second app and snap it right with win + right.
+  - If both apps are non-browser apps, open the first app, snap it left, then open the second app and snap it right.
+- After the terminal is focused, set its cwd with:
+  `Set-Location -LiteralPath "__BOOTSTRAP_CWD__"` 
+- Do not output markdown or prose.
+- Return exactly one bootstrap step.
+
+Context summary:
+__SUMMARY_PLACEHOLDER__
+
+Return ONLY a JSON object matching one of these exact shapes:
+{
+  "playbook": [
+    {
+      "step_id": 0,
+      "title": "workspace bootstrap",
+      "intent": "prepare workspace",
+      "expected_tool": "gui",
+      "original_command": "",
+      "adapted_command": "",
+      "safety_level": "green",
+      "notes": "Phase 0 workspace bootstrap",
+      "reasoning": "Why this workspace is needed",
+      "target_app_name": "os",
+      "actions": [
+        { "type": "hotkey", "keys": ["win"] },
+        { "type": "sleep", "duration": 1 },
+        { "type": "type", "text": "Application Name", "press_enter": true },
+        { "type": "sleep", "duration": 5 },
+        { "type": "hotkey", "keys": ["win", "up"] },
+        { "type": "sleep", "duration": 1 },
+        { "type": "type", "text": "Set-Location -LiteralPath \"__BOOTSTRAP_CWD__\"", "press_enter": true }
+      ],
+      "verification": {
+        "expected_state": "Application Name is open and maximized on the desktop."
+      }
+    }
+  ]
+}
+
+OR
+
+{
+  "playbook": [
+    {
+      "step_id": 0,
+      "title": "workspace bootstrap",
+      "intent": "prepare split workspace",
+      "expected_tool": "gui",
+      "original_command": "",
+      "adapted_command": "",
+      "safety_level": "green",
+      "notes": "Phase 0 workspace bootstrap",
+      "reasoning": "Why this workspace is needed",
+      "target_app_name": "os",
+      "actions": [
+        { "type": "hotkey", "keys": ["win", "left"] },
+        { "type": "sleep", "duration": 1 },
+        { "type": "hotkey", "keys": ["win"] },
+        { "type": "sleep", "duration": 1 },
+        { "type": "type", "text": "Second App", "press_enter": true },
+        { "type": "sleep", "duration": 5 },
+        { "type": "hotkey", "keys": ["win", "right"] },
+        { "type": "sleep", "duration": 1 },
+        { "type": "type", "text": "Set-Location -LiteralPath \"__BOOTSTRAP_CWD__\"", "press_enter": true }
+      ],
+      "verification": {
+        "expected_state": "Browser is snapped left and Second App is open on the right side of the desktop."
+      }
+    }
+  ]
+}
+"""
+    prompt = prompt_template.replace(
+        "__SUMMARY_PLACEHOLDER__",
+        transcript_summary if transcript_summary else "No transcript summary provided.",
+    ).replace("__TARGET_WORKSPACE__", target_workspace_json).replace("__BOOTSTRAP_CWD__", bootstrap_cwd or ".")
+
+    try:
+        response = create_completion_with_fallback(
+            messages=[{"role": "user", "content": prompt}],
+            timeout=15,
+            temperature=0.0,
+        )
+        raw_text = response.choices[0].message.content
+        payload = bulletproof_json(raw_text)
+        if isinstance(payload, dict) and isinstance(payload.get("playbook"), list) and payload["playbook"]:
+            try:
+                validated = validate_workspace_setup_playbook(payload, target_workspace, bootstrap_cwd)
+            except ValueError as exc:
+                print(f"[!] Setup payload rejected: {exc}. Falling back to target workspace: {target_workspace}")
+                return build_workspace_setup_playbook(target_workspace, bootstrap_cwd)
+            print(f"[SUCCESS] Setup payload parsed: {validated}")
+            return validated
+        print(f"[!] Setup JSON parse failed. Falling back to target workspace: {target_workspace}")
+        return build_workspace_setup_playbook(target_workspace, bootstrap_cwd)
+    except Exception as exc:
+        print(f"[!] Vision runtime setup generation failed: {exc}. Falling back to target workspace: {target_workspace}")
+        return build_workspace_setup_playbook(target_workspace, bootstrap_cwd)
+
+
+@app.post("/propose")
+async def propose_manifest(req: ProposeRequest):
+    print("\n[*] Routing proposal payload to vision runtime...")
+    transcript_summary = (req.transcript_summary or "").strip()
+    expected_environment = (req.expected_environment or "").strip()
+    local_tutorial_path = str(req.local_tutorial_path or "").strip()
+    visual_events = req.visual_events or []
+    raw_candidates = req.candidates or []
+    global_context_path = str(req.global_context_path or "").strip()
+    global_context_description = req.global_context_description or {}
+    keyframe_descriptions = req.keyframe_descriptions or []
+    semantic_segments: list[dict] = []
+    candidate_segments = raw_candidates if raw_candidates else visual_events
+    for event in candidate_segments:
+        if not isinstance(event, dict):
+            continue
+        ocr_tokens = event.get("ocr_tokens") or []
+        if not isinstance(ocr_tokens, list):
+            ocr_tokens = []
+        semantic_segments.append(
+            {
+                "timestamp": event.get("timestamp", 0),
+                "timecode": str(event.get("timecode") or ""),
+                "app_focus": str(event.get("app_focus") or ""),
+                "layout_hint": str(event.get("layout_hint") or ""),
+                "change_type": str(event.get("change_type") or ""),
+                "candidate_sources": event.get("candidate_sources") or [],
+                "confidence_score": event.get("confidence_score", 0.5),
+                "ui_states": event.get("ui_states") or [],
+                "transcript_hints": event.get("transcript_hints") or [],
+                "changed_regions": event.get("changed_regions") or [],
+                "ocr_tokens": [str(token).strip() for token in ocr_tokens if str(token).strip()][:10],
+                "ocr_snippet": str(event.get("ocr_snippet") or ""),
+                "thumbnail_path": str(event.get("thumbnail_path") or ""),
+            }
+        )
+
+    content_payload = [
+        {
+            "type": "text",
+            "text": (
+                "Act as Mimiq's Temporal Milestone Planner. "
+                "Analyze these candidate transitions and optional Transcript context. "
+                "The candidate transitions come from FFmpeg scene detection plus OCR/layout mining. "
+                "Treat this as a storyboard of possible chapter starts, not a full transcript of the tutorial. "
+                "Use these candidates as the primary ground truth for exactly when a new phase begins. "
+                "Ignore visual noise such as cursor movement, tiny scrolls, blinking carets, or small edits that do not change the workflow milestone. "
+                "Reject candidate frames that only show continuation inside the same milestone. "
+                "Candidate sources tell you whether a milestone came from a hard scene cut, an OCR pulse, an app-focus shift, or a transcript hint. Multi-signal candidates are stronger. "
+                "UI states tell you whether you are looking at dependency installation, code, docs, server output, or mode toggles. "
+                "Use the Transcript only to name or refine the phase when it supports the visuals. "
+                "Perform visual-intent inference: infer why the user is in each segment from OCR tokens, "
+                "OCR snippets, layout hints, window focus, and visible code or commands instead of describing only what application is open. "
+                "Treat OCR tokens as semantic clues, not as labels to copy verbatim. "
+                "Frame 0 is the final result of the tutorial. Use it as the north-star end state so you understand what the tutorial is building toward. "
+                "You are defining only macro-phase boundaries, not verification answers.\n\n"
+                f"Expected environment: {expected_environment or 'Unspecified'}\n"
+                f"Global context frame summary:\n{json.dumps(global_context_description, ensure_ascii=False, indent=2) or '{}'}\n\n"
+                f"Candidate transitions:\n{json.dumps(semantic_segments, ensure_ascii=False, indent=2)}\n\n"
+                f"Transcript summary:\n{transcript_summary or 'No transcript available. Name phases from visual evidence only.'}\n\n"
+                f"Candidate storyboard OCR summaries:\n{json.dumps(keyframe_descriptions, ensure_ascii=False, indent=2)}\n\n"
+                "Return ONLY JSON with this schema:\n"
+                "{\n"
+                '  "demo_name": "Short draft name",\n'
+                '  "expected_environment": "Primary applications involved",\n'
+                '  "phases": [\n'
+                "    {\n"
+                '      "phase_id": 1,\n'
+                '      "timecode": "00:00:07",\n'
+                '      "description": "Dependency Installation",\n'
+                '      "expected_focus": "Terminal",\n'
+                '      "required_workspace": ["Browser", "Windows PowerShell"],\n'
+                '      "phase_mode": "terminal_install",\n'
+                '      "strict_action_type": "keyboard_input",\n'
+                '      "verification_mode": "ocr_focus",\n'
+                '      "success_signals": ["fastapi", "uvicorn", "requirement already satisfied"],\n'
+                '      "failure_signals": ["error", "command not found"],\n'
+                '      "confidence_score": 0.93\n'
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
+                "Rules:\n"
+                "- Output exactly 3 to 5 phases.\n"
+                "- Sort phases by ascending timecode.\n"
+                "- Use only macro milestones a supervisor would approve.\n"
+                "- phase_mode is required for every phase.\n"
+                "- phase_mode must be one of: terminal_install, terminal_run, type_code, browser_verify, browser_navigate.\n"
+                "- Do not output markdown or prose."
+            ),
+        }
+    ]
+
+    encoded_global = _encode_image_file(global_context_path)
+    if encoded_global:
+        content_payload.append({"type": "text", "text": "frame_0_final_context: final result frame for the full tutorial."})
+        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_global}"}})
+
+    for index, frame_path in enumerate(req.keyframe_paths, start=1):
+        encoded = _encode_image_file(frame_path)
+        if not encoded:
+            continue
+        content_payload.append({"type": "text", "text": f"candidate_frame_{index}: storyboard candidate."})
+        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+
+    try:
+        response = create_completion_with_fallback(
+            messages=[{"role": "user", "content": content_payload}],
+            timeout=20,
+            temperature=0.0,
+        )
+        raw_text = response.choices[0].message.content
+        payload = bulletproof_json(raw_text)
+        if payload is None:
+            return JSONResponse({"error": "Proposal JSON parse failed."}, status_code=500)
+        try:
+            validated = validate_proposal_manifest({
+                **payload,
+                "local_tutorial_path": local_tutorial_path,
+                "expected_environment": payload.get("expected_environment") or expected_environment,
+            })
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return validated
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/playbook")
+async def get_playbook(req: PlaybookRequest):
+    print("\n[*] Fetching local desktop + tutorial frame and routing payload to vision runtime...")
+
+    tutorial_frame_path = req.tutorial_frame_path
+    phase_context = (req.context or "").strip()
+    phase_timecode = (req.timecode or "").strip()
+    phase_contract = req.phase_contract or {}
+    recent_state = req.recent_state or {}
+    milestone_context = req.milestone_context or {}
+    allowed_target_apps = sorted(_allowed_target_apps_for_phase(phase_contract))
+    local_desktop_image = get_local_desktop_image()
+    local_desktop_b64, action_surface_b64, crop_bbox = crop_desktop_to_app_region(local_desktop_image, phase_contract)
+    tutorial_frame_b64 = get_tutorial_frame_base64(tutorial_frame_path)
+
+    prompt_template = """
+You are a Visual Reasoning Agent. You have two images:
+1. TUTORIAL_FRAME: A screenshot from the tutorial reference media at T=__TIMECODE_PLACEHOLDER__.
+2. LOCAL_DESKTOP: The user's current screen.
+
+TASK:
+1. Identify the active UI element the instructor is interacting with in TUTORIAL_FRAME.
+2. Find the equivalent UI element in LOCAL_DESKTOP.
+3. If the element is missing, look for the parent element that must be clicked first.
+
+TRANSCRIPT CONTEXT FOR THIS EXACT PHASE:
+__CONTEXT_PLACEHOLDER__
+
+STRICT INSTRUCTION:
+Your ONLY goal is to replicate the EXACT action shown in TUTORIAL_FRAME.
+Do NOT generate bootstrap actions to open Start Menu, search for apps, or launch apps.
+
+CRITICAL WORKSPACE RULES:
+1. THE YOUTUBE TRAP: Never click the tutorial video player. It is reference only.
+2. WORKSPACE STATE ASSUMPTION: Apps required by the Phase Contract are ALREADY OPEN.
+3. THE TERMINAL TRAP: Ignore the agent's own terminal window. Never read it or click it.
+
+TYPE_CODE OVERRIDE:
+If phase_mode is type_code, target Visual Studio Code ONLY.
+Emit: (1) Ctrl+A, (2) Delete, (3) type full code, (4) Ctrl+S.
+
+Output ONLY a JSON object with this schema:
+{
+  "playbook": [
+    {
+      "step_id": 1,
+      "title": "Short title",
+      "intent": "Goal",
+      "expected_tool": "browser",
+      "original_command": "",
+      "adapted_command": "",
+      "safety_level": "green",
+      "notes": "",
+      "reasoning": "Why this matches",
+      "target_app_name": "Browser",
+      "actions": [
+        {"type": "click", "target_description": "element", "coordinates": [640, 360]},
+        {"type": "type", "text": "text to type"}
+      ],
+      "verification": {
+        "expected_state": "Success description.",
+        "expected_visual_state": "What screen looks like.",
+        "focus": "Browser",
+        "success_signals": ["visible cue"],
+        "failure_signals": ["error text"],
+        "verification_mode": "vision_state"
+      }
+    }
+  ]
+}
+Do not output markdown or prose.
+"""
+    if phase_contract:
+        contract_blob = json.dumps(phase_contract, ensure_ascii=False, indent=2)
+        allowed_targets_blob = json.dumps(allowed_target_apps, ensure_ascii=False)
+        prompt_template += f"""
+DEMO PHASE CONTRACT:
+{contract_blob}
+
+Contract rules:
+- expected_target_app_name is mandatory.
+- TARGET APP ENFORCEMENT: Only target one of: {allowed_targets_blob}
+- If phase_mode is terminal_install or terminal_run, emit concrete command text.
+- If phase_mode is type_code, target_app_name and verification.focus must be Visual Studio Code.
+- If strict_action_type is present, every non-sleep action must use that exact type.
+- If success_signals are present, copy them into verification.success_signals.
+"""
+    if recent_state:
+        prompt_template += f"""
+RECENT EXECUTION STATE:
+{json.dumps(recent_state, ensure_ascii=False, indent=2)}
+- Do NOT repeat completed phases.
+- If a tool is unavailable, choose the closest locally executable alternative.
+- If current_phase_failure is present, NEVER repeat the exact same failing command.
+"""
+    if milestone_context:
+        prompt_template += f"""
+LOCAL MILESTONE CONTEXT:
+{json.dumps(milestone_context, ensure_ascii=False, indent=2)}
+- Anchor your action to the CURRENT milestone only.
+"""
+    prompt = (
+        prompt_template
+        .replace("__TIMECODE_PLACEHOLDER__", phase_timecode or "[Timecode]")
+        .replace("__CONTEXT_PLACEHOLDER__", phase_context or "No transcript context provided.")
+    )
+
+    content_payload = [{"type": "text", "text": prompt}]
+
+    if local_desktop_b64:
+        content_payload.append({"type": "text", "text": "image_1 (LOCAL_DESKTOP_CONTEXT_ONLY): CONTEXT ONLY — DO NOT CLICK."})
+        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{local_desktop_b64}"}})
+
+    if action_surface_b64:
+        content_payload.append({"type": "text", "text": "image_2 (ACTION_SURFACE): ACTION SURFACE — ALL COORDINATES MUST BE FROM THIS IMAGE."})
+        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{action_surface_b64}"}})
+
+    if tutorial_frame_b64:
+        content_payload.append({"type": "text", "text": "image_3 (TUTORIAL_FRAME): The tutorial reference frame for the current step."})
+        content_payload.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tutorial_frame_b64}"}})
+
+    try:
+        response = create_completion_with_fallback(
+            messages=[{"role": "user", "content": content_payload}],
+            timeout=15,
+            temperature=0.0,
+        )
+        raw_text = response.choices[0].message.content
+        playbook_dict = bulletproof_json(raw_text)
+        if playbook_dict is not None:
+            try:
+                validated = validate_playbook_payload(playbook_dict)
+                validated = validate_phase_contract_payload(validated, phase_contract)
+                validated = _translate_playbook_coordinates_to_full_desktop(validated, crop_bbox)
+            except ValueError as exc:
+                logging.error("Playbook validation failed: %s", exc)
+                return {"error": str(exc), "raw_payload": raw_text}
+            return validated
+        return {"error": "Playbook JSON parse failed.", "raw_payload": raw_text}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+if __name__ == "__main__":
+    print("[*] Mimiq Cloud Brain Booting...")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("CLOUD_BRAIN_PORT", "8000")),
+        timeout_keep_alive=600,
+        timeout_graceful_shutdown=600,
+    )
