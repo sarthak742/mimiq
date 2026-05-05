@@ -1,5 +1,5 @@
 # Mimiq Project State Ledger
-**Last Updated:** Day 1, 2026-05-05 18:42:58 IST
+**Last Updated:** Day 2, 2026-05-05 23:21 IST
 
 ## 1. The Macro Goal
 Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.mp4), extracts actionable steps via an AMD-powered vision model, and executes them with visual verification.
@@ -13,13 +13,13 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 ## 3. Completed Slices (Locked & Committed)
 *   [x] **Slice 0:** `codex.md` created with global project instructions.
 *   [x] **Slice 1:** Initial scaffolding (`requirements.txt`, `.gitignore`, `config.py` with AMD hardware guards, empty package directories).
+*   [x] **Slice 2:** `cloud_brain.py` FastAPI bridge rebuilt with PRIMARY_VISION env routing, /health endpoint, and CLOUD_BRAIN_PORT support.
 
 ## 4. Current Active Slice (In Progress)
-*   **Target:** `cloud_brain.py` (The FastAPI bridge).
-*   **Current Status:** Generating the full 900+ line file. Ensuring strict retention of all existing validation logic, prompt templates, and `create_completion_with_fallback` logic.
-*   **Next Step:** Verify `python -m py_compile cloud_brain.py` passes, then commit.
+*   **Target:** `utils/composer.py` (Video manifest and prerequisite handling).
+*   **Current Status:** Not yet started.
+*   **Next Step:** Scaffold `utils/composer.py` with video manifest ingestion and dependency prerequisite logic.
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 3:** `utils/composer.py` (Video manifest and prerequisite handling).
 *   [ ] **Slice 4:** `executor/action_runner.py` & `screen_capture.py`.
 *   [ ] **Slice 5:** `ui/app.py` & `ui/static/index.html` (Local demo path).
