@@ -14,12 +14,12 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 0:** `codex.md` created with global project instructions.
 *   [x] **Slice 1:** Initial scaffolding (`requirements.txt`, `.gitignore`, `config.py` with AMD hardware guards, empty package directories).
 *   [x] **Slice 2:** `cloud_brain.py` FastAPI bridge rebuilt with PRIMARY_VISION env routing, /health endpoint, and CLOUD_BRAIN_PORT support.
+*   [x] **Slice 3:** `utils/composer.py` goal-aware manifest composition with prerequisite pooling, deduplication, and cumulative code patching.
 
 ## 4. Current Active Slice (In Progress)
-*   **Target:** `utils/composer.py` (Video manifest and prerequisite handling).
+*   **Target:** `executor/action_runner.py` & `screen_capture.py` (Execution engine).
 *   **Current Status:** Not yet started.
-*   **Next Step:** Scaffold `utils/composer.py` with video manifest ingestion and dependency prerequisite logic.
+*   **Next Step:** Build `executor/action_runner.py` with pyautogui action translation and thread-safe playbook execution.
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 4:** `executor/action_runner.py` & `screen_capture.py`.
 *   [ ] **Slice 5:** `ui/app.py` & `ui/static/index.html` (Local demo path).
