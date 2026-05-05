@@ -19,16 +19,8 @@ if load_dotenv is not None:
 
 PROVIDER = os.getenv("PROVIDER", "gemini").strip().lower()
 
-PRIMARY_VISION_URL = (
-    os.getenv("PRIMARY_VISION_URL")
-    or os.getenv("NVIDIA_API_BASE")
-    or ""
-).strip()
-PRIMARY_VISION_KEY = (
-    os.getenv("PRIMARY_VISION_KEY")
-    or os.getenv("NVIDIA_API_KEY")
-    or ""
-).strip()
+PRIMARY_VISION_URL = os.getenv("PRIMARY_VISION_URL", "").strip()
+PRIMARY_VISION_KEY = os.getenv("PRIMARY_VISION_KEY", "").strip()
 PRIMARY_VISION_MODEL = os.getenv(
     "PRIMARY_VISION_MODEL",
     "Qwen/Qwen2.5-VL-72B-Instruct",
@@ -102,10 +94,14 @@ def require_real_vision_endpoint() -> None:
         "localhost",
         "127.0.0.1",
         "0.0.0.0",
+        "<amd-endpoint>",
     )
 
     if not normalized_url or any(marker in normalized_url for marker in blocked_markers):
-        raise ValueError(f"PRIMARY_VISION_URL not configured: {PRIMARY_VISION_URL}")
+        raise ValueError(
+            f"PRIMARY_VISION_URL is not a real AMD endpoint: '{PRIMARY_VISION_URL}'. "
+            "Set PRIMARY_VISION_URL to the AMD Developer Cloud endpoint in .env."
+        )
 
 
 if PROVIDER == "amd":
