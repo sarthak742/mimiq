@@ -16,10 +16,11 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 2:** `cloud_brain.py` FastAPI bridge rebuilt with PRIMARY_VISION env routing, /health endpoint, and CLOUD_BRAIN_PORT support.
 *   [x] **Slice 3:** `utils/composer.py` goal-aware manifest composition with prerequisite pooling, deduplication, and cumulative code patching.
 *   [x] **Slice 4:** `executor/action_runner.py` thread-safe pyautogui action runner with short-command fix.
+*   [x] **Slice 5:** `executor/safety.py` pure-logic deterministic safety classifier (GREEN/YELLOW/RED) with thread-safe singleton.
 
 ## 4. Current Active Slices (In Progress)
-*   **Slice 5:** `executor/screen_capture.py` (Desktop capture utilities).
-*   **Slice 6:** `main.py` (Central Nervous System / orchestrator wiring cloud_brain, composer, and action_runner).
+*   **Slice 6:** `executor/screen_capture.py` refactoring into context manager.
+*   **Slice 7:** `main.py` (Central Nervous System / orchestrator wiring cloud_brain, composer, and action_runner).
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 7:** `ui/app.py` & `ui/static/index.html` (Local demo path).
+*   [ ] **Slice 8:** `ui/app.py` & `ui/static/index.html` (Local demo path).
