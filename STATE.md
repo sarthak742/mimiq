@@ -17,10 +17,14 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 3:** `utils/composer.py` goal-aware manifest composition with prerequisite pooling, deduplication, and cumulative code patching.
 *   [x] **Slice 4:** `executor/action_runner.py` thread-safe pyautogui action runner with short-command fix.
 *   [x] **Slice 5:** `executor/safety.py` pure-logic deterministic safety classifier (GREEN/YELLOW/RED) with thread-safe singleton.
+*   [x] **Slice 6:** `executor/screen_capture.py` refactored into context manager with standalone capture().
+*   [x] **Slice 7:** `executor/failsafe.py` PyAutoGUI corner-detection failsafe wrapper.
 
 ## 4. Current Active Slices (In Progress)
-*   **Slice 6:** `executor/screen_capture.py` refactoring into context manager.
-*   **Slice 7:** `main.py` (Central Nervous System / orchestrator wiring cloud_brain, composer, and action_runner).
+*   **Slice 8:** `executor/os_adapter.py` (Cross-shell command adaptation for Windows).
+*   **Slice 9:** `executor/stdout_watcher.py` (Process stdout monitoring with signal detection).
+*   **Slice 10:** `executor/hitl_overlay.py` (Human-in-the-loop decision overlay).
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 8:** `ui/app.py` & `ui/static/index.html` (Local demo path).
+*   [ ] **Slice 11:** `main.py` (Central Nervous System / orchestrator).
+*   [ ] **Slice 12:** `ui/app.py` & `ui/static/index.html` (Local demo path).
