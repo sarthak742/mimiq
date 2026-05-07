@@ -1,122 +1,98 @@
 """Mimiq Central Nervous System.
 
-Wires cloud_brain (vision reasoning), utils.composer (plan scoring),
-and executor.action_runner (physical execution) into a single async
-orchestration pipeline.
+Ingestion  →  Deduplication  →  Manifest Generation
+
+Takes a local tutorial video, extracts frames at 1 fps, prunes
+visually-identical duplicates, and asks the vision model to produce a
+structured JSON action manifest.  The executor is deliberately NOT wired
+up here so the operator can inspect the manifest before the agent takes
+control of the mouse.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
+from pathlib import Path
 
-import cloud_brain
-from executor import action_runner
-from utils import composer
+from extractor.deduplicator import Deduplicator
+from extractor.frame_sampler import FrameSampler
+from understander import manifest_generator
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
-async def run_mimiq(goal: str, video_path: str) -> None:
-    """End-to-end Mimiq pipeline: propose -> compose -> playbook -> execute."""
-    # ------------------------------------------------------------------
-    # Step 1: Call cloud_brain.propose to get the initial manifest
-    # ------------------------------------------------------------------
-    propose_req = cloud_brain.ProposeRequest(
-        os_name="windows",
-        video_url="",
-        local_tutorial_path=video_path,
-        transcript_summary="",
-        expected_environment="",
-        visual_events=[],
-        candidates=[],
-        global_context_path="",
-        global_context_description={},
-        keyframe_paths=[],
-        keyframe_descriptions=[],
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Mimiq — Ingest a tutorial video and generate an actionable manifest."
     )
-    logging.info("[Step 1] Requesting proposal manifest from cloud_brain...")
-    propose_resp = await cloud_brain.propose_manifest(propose_req)
+    parser.add_argument(
+        "video_path",
+        type=str,
+        help="Path to the local tutorial video (.mp4)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="output",
+        help="Directory for extracted frames and generated manifest (default: output)",
+    )
+    args = parser.parse_args()
 
-    # FastAPI JSONResponse or raw dict normalisation
-    if hasattr(propose_resp, "body"):
-        import json
+    video_path = Path(args.video_path).resolve()
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        manifest = json.loads(propose_resp.body)
-    else:
-        manifest = propose_resp
-
-    if isinstance(manifest, dict) and "error" in manifest:
-        logging.error("Proposal failed: %s", manifest["error"])
-        return
-
-    logging.info("[Step 1] Proposal received with %d phase(s).", len(manifest.get("phases", [])))
+    frames_dir = out_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Step 2: Call composer.compose_plan to score and patch phases
+    # Step 1: Ingestion — extract frames at ~1 fps
     # ------------------------------------------------------------------
-    logging.info("[Step 2] Composing plan against goal: %s", goal)
-    final_manifest, gap_report = composer.compose_plan(goal, manifest)
+    logging.info("Starting Ingestion...")
+    sampler = FrameSampler()
+    info = sampler.get_video_info(video_path)
+    duration = info.get("duration", 0.0)
+    frame_count = max(1, int(duration))
+
     logging.info(
-        "[Step 2] Composed plan: %d phase(s) | missing deps: %s",
-        len(final_manifest.get("phases", [])),
-        gap_report.get("missing_dependencies", []),
+        "Video duration: %.2fs → extracting %d frame(s) to %s",
+        duration,
+        frame_count,
+        frames_dir,
+    )
+    raw_frames = sampler.extract_uniform_frames(
+        video_path, count=frame_count, output_dir=frames_dir
     )
 
     # ------------------------------------------------------------------
-    # Step 3 + 4: For each phase, get playbook and execute
+    # Step 2: Deduplication — prune visually-identical neighbours
     # ------------------------------------------------------------------
-    phases = final_manifest.get("phases", [])
-    if not phases:
-        logging.warning("No phases to execute.")
+    logging.info("Deduplicating frames...")
+    deduplicator = Deduplicator()
+    survivors = deduplicator.filter_duplicates(raw_frames)
+    logging.info("%d frame(s) survived deduplication.", len(survivors))
+
+    if not survivors:
+        logging.error("No frames remain after deduplication. Aborting.")
         return
 
-    for idx, phase in enumerate(phases, start=1):
-        phase_id = phase.get("phase_id", idx)
-        description = phase.get("description", "")
-        timecode = phase.get("timecode", "")
-        logging.info("[Phase %d/%d] %s — %s", idx, len(phases), timecode, description)
+    # ------------------------------------------------------------------
+    # Step 3: Manifest generation — ask the vision model for actions
+    # ------------------------------------------------------------------
+    logging.info("Generating actionable manifest...")
+    manifest_path = out_dir / "manifest.json"
+    manifest = manifest_generator.generate_manifest(
+        frame_paths=survivors,
+        output_path=manifest_path,
+    )
 
-        playbook_req = cloud_brain.PlaybookRequest(
-            os_name="windows",
-            video_url="",
-            tutorial_frame_path="",
-            context=description,
-            timecode=timecode,
-            phase_contract=phase,
-            recent_state={},
-            milestone_context={},
-        )
-        playbook_resp = await cloud_brain.get_playbook(playbook_req)
-
-        if hasattr(playbook_resp, "body"):
-            import json
-
-            playbook = json.loads(playbook_resp.body)
-        else:
-            playbook = playbook_resp
-
-        if isinstance(playbook, dict) and "error" in playbook:
-            logging.error("Playbook generation failed for phase %d: %s", phase_id, playbook["error"])
-            continue
-
-        if not isinstance(playbook, dict) or not playbook.get("playbook"):
-            logging.warning("Empty playbook for phase %d; skipping.", phase_id)
-            continue
-
-        logging.info("[Phase %d/%d] Executing playbook with %d step(s)...", idx, len(phases), len(playbook["playbook"]))
-        success = action_runner.execute_playbook(playbook)
-        if not success:
-            logging.error("Execution failed at phase %d. Halting pipeline.", phase_id)
-            return
-
-    logging.info("Mimiq execution completed successfully.")
+    logging.info(
+        "Success! Manifest ready for review: %s (%d action(s))",
+        manifest_path,
+        len(manifest),
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mimiq — Autonomous Desktop Agent")
-    parser.add_argument("--goal", required=True, help="The user's high-level goal (e.g. 'Build a FastAPI app')")
-    parser.add_argument("--video", required=True, help="Path to the local tutorial video (.mp4)")
-    args = parser.parse_args()
-    asyncio.run(run_mimiq(args.goal, args.video))
+    main()

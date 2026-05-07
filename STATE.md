@@ -26,10 +26,10 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 12:** `executor/verification.py` & `executor/recovery.py` vision-feedback loop and action recovery.
 *   [x] **Slice 13:** `extractor/frame_sampler.py` video ingestion and frame extraction via ffmpeg.
 *   [x] **Slice 14:** `extractor/deduplicator.py` frame deduplication via MSE thresholding.
+*   [x] **Slice 15:** `understander/manifest_generator.py` vision model manifest generation from UI frames.
 
 ## 4. Current Active Slices (In Progress)
-*   **Slice 15:** `understander/manifest_generator.py` (Vision model manifest generation from UI frames).
+*   **Slice 16:** `main.py` (Central Nervous System / orchestrator — ingestion → deduplication → manifest pipeline).
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 16:** `main.py` (Central Nervous System / orchestrator).
 *   [ ] **Slice 17:** `ui/app.py` & `ui/static/index.html` (Local demo path).
