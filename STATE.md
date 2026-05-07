@@ -24,10 +24,11 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 10:** `executor/hitl_overlay.py` human-in-the-loop decision overlay.
 *   [x] **Slice 11:** `executor/calibrator.py` DPI-aware coordinate scaler.
 *   [x] **Slice 12:** `executor/verification.py` & `executor/recovery.py` vision-feedback loop and action recovery.
+*   [x] **Slice 13:** `extractor/frame_sampler.py` video ingestion and frame extraction via ffmpeg.
 
 ## 4. Current Active Slices (In Progress)
-*   **Slice 13:** `extractor/frame_sampler.py` (Video ingestion and frame extraction via ffmpeg).
+*   **Slice 14:** `extractor/deduplicator.py` (Frame deduplication via MSE thresholding).
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 14:** `main.py` (Central Nervous System / orchestrator).
-*   [ ] **Slice 15:** `ui/app.py` & `ui/static/index.html` (Local demo path).
+*   [ ] **Slice 15:** `main.py` (Central Nervous System / orchestrator).
+*   [ ] **Slice 16:** `ui/app.py` & `ui/static/index.html` (Local demo path).
