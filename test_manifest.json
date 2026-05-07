@@ -1,0 +1,30 @@
+[
+  {
+    "step": 1,
+    "action_type": "click",
+    "target_description": "Click the center of the screen to focus",
+    "coordinates": [960, 540],
+    "value": null
+  },
+  {
+    "step": 2,
+    "action_type": "wait",
+    "target_description": "Wait for 1 second",
+    "coordinates": null,
+    "value": "1.0"
+  },
+  {
+    "step": 3,
+    "action_type": "type",
+    "target_description": "Type a test string",
+    "coordinates": null,
+    "value": "Hello AMD Hackathon"
+  },
+  {
+    "step": 4,
+    "action_type": "hotkey",
+    "target_description": "Open the Windows Start Menu",
+    "coordinates": null,
+    "value": "win"
+  }
+]
