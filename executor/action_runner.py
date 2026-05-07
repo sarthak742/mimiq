@@ -1,124 +1,199 @@
-"""Translate Cloud Brain payloads into physical OS interactions via pyautogui."""
+"""HITL-guarded manifest executor with DPI scaling and shell adaptation.
+
+Loads a JSON action manifest produced by the understander and drives
+PyAutoGUI / subprocess to carry out each step.  Every action is gated by
+a human-in-the-loop overlay so the operator can approve, reject, or skip.
+"""
 
 from __future__ import annotations
 
+import json
 import logging
-import threading
+import subprocess
 import time
+from pathlib import Path
+from typing import Any
 
 import pyautogui
+
+from executor.calibrator import get_calibrator
+from executor.hitl_overlay import HitlDecision, show_hitl_overlay
+from executor.os_adapter import get_adapter
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.5
 
-_execution_lock = threading.Lock()
-
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-_SHORT_COMMANDS = {"ls", "clear", "pwd", "npm i", "npm install"}
 
+class ActionRunner:
+    """Orchestrates manifest execution with per-step HITL approval."""
 
-def execute_action(action: dict) -> bool:
-    """Execute a single action dict and return True on success."""
-    if not isinstance(action, dict):
-        logging.error("Action must be a dict, got %s", type(action).__name__)
-        return False
+    def __init__(self) -> None:
+        self._calibrator = get_calibrator()
+        self._adapter = get_adapter()
 
-    action_type = str(action.get("type") or "").strip().lower()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    if action_type == "click":
-        coords = action.get("coordinates")
-        if not isinstance(coords, list) or len(coords) < 2:
-            logging.error("Click action requires a coordinates list of at least 2 ints.")
-            return False
-        x = int(coords[0])
-        y = int(coords[1])
-        pyautogui.click(x, y)
-        logging.info("Executed click at (%d, %d)", x, y)
-        return True
+    def execute_manifest(self, manifest_path: Path) -> None:
+        """Load the JSON manifest at *manifest_path* and execute every action.
 
-    if action_type == "type":
-        text = str(action.get("text") or "").strip()
-        if not text:
-            logging.error("Type action requires non-empty text.")
-            return False
+        Each action triggers a HITL overlay.  The operator can:
 
-        press_enter = bool(action.get("press_enter"))
+        * **APPROVE** — run the action.
+        * **REJECT** — abort the entire sequence.
+        * **SKIP**   — skip to the next action.
 
-        # Short-command fix: force Enter for common shell commands
-        if text in _SHORT_COMMANDS and not press_enter:
-            press_enter = True
+        A 1-second pause is inserted between consecutive actions.
+        """
+        manifest_path = manifest_path.resolve()
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-        pyautogui.write(text, interval=0.05)
-        if press_enter:
-            pyautogui.press("enter")
-        logging.info("Typed text (press_enter=%s)", press_enter)
-        return True
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            actions: list[dict[str, Any]] = json.load(fh)
 
-    if action_type == "hotkey":
-        keys = action.get("keys")
-        if not isinstance(keys, list) or not keys:
-            logging.error("Hotkey action requires a non-empty keys list.")
-            return False
-        clean_keys = [str(key).strip() for key in keys if str(key).strip()]
-        if not clean_keys:
-            logging.error("Hotkey action has no valid keys after cleaning.")
-            return False
-        pyautogui.hotkey(*clean_keys)
-        logging.info("Executed hotkey: %s", " + ".join(clean_keys))
-        return True
+        if not isinstance(actions, list):
+            raise ValueError(
+                f"Manifest root must be a JSON array, got {type(actions).__name__}."
+            )
 
-    if action_type == "sleep":
-        duration = float(action.get("duration") or action.get("seconds") or 1.0)
-        duration = max(0.0, duration)
-        time.sleep(duration)
-        logging.info("Slept for %.2f seconds", duration)
-        return True
+        logging.info("[action_runner] Loaded manifest with %d action(s).", len(actions))
 
-    logging.error("Unsupported action type: '%s'", action_type)
-    return False
+        for action in actions:
+            step = action.get("step", "?")
+            target = action.get("target_description", "unknown target")
 
+            decision = show_hitl_overlay(
+                f"Execute Step {step}: {target}?",
+                timeout=60.0,
+            )
 
-def execute_playbook(playbook_payload: dict) -> bool:
-    """Execute a full playbook under the global execution lock. Return True on success."""
-    try:
-        if not isinstance(playbook_payload, dict):
-            logging.error("Playbook payload must be a dict.")
-            return False
+            if decision is HitlDecision.REJECT:
+                logging.warning("[action_runner] Step %s REJECTED — aborting sequence.", step)
+                return
 
-        steps = playbook_payload.get("playbook")
-        if not isinstance(steps, list) or not steps:
-            logging.error("Playbook payload must contain a non-empty 'playbook' list.")
-            return False
+            if decision is HitlDecision.SKIP:
+                logging.info("[action_runner] Step %s SKIPPED.", step)
+                continue
 
-        with _execution_lock:
-            for step_index, step in enumerate(steps, start=1):
-                if not isinstance(step, dict):
-                    logging.warning("Step %d is not a dict; skipping.", step_index)
-                    continue
+            if decision is HitlDecision.APPROVE:
+                self._execute_single(action)
+                time.sleep(1.0)
+                continue
 
-                actions = step.get("actions")
-                if not isinstance(actions, list) or not actions:
-                    logging.warning("Step %d has no actions; skipping.", step_index)
-                    continue
+            # Timeout / unknown decision → treat as skip to be safe
+            logging.info(
+                "[action_runner] Step %s timed out or returned no decision — skipping.",
+                step,
+            )
 
-                step_title = str(step.get("title") or f"Step {step_index}").strip()
-                logging.info("Executing step %d: %s", step_index, step_title)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-                for action_index, action in enumerate(actions, start=1):
-                    success = execute_action(action)
-                    if not success:
-                        logging.error(
-                            "Step %d (%s) action %d failed: %s",
-                            step_index,
-                            step_title,
-                            action_index,
-                            action,
-                        )
-                        return False
+    def _execute_single(self, action: dict[str, Any]) -> None:
+        """Dispatch a single action dict to the appropriate handler."""
+        action_type = str(action.get("action_type") or "").strip().lower()
+        step = action.get("step", "?")
 
-        logging.info("Playbook executed successfully.")
-        return True
-    except Exception as exc:
-        logging.error("Playbook execution failed: %s", exc)
-        return False
+        if action_type == "click":
+            coords = action.get("coordinates")
+            if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+                logging.error(
+                    "[action_runner] Step %s: click requires [x, y] coordinates.", step
+                )
+                return
+            raw_x = int(coords[0])
+            raw_y = int(coords[1])
+            x, y = self._calibrator.scale_coordinates(raw_x, raw_y)
+            pyautogui.click(x, y)
+            logging.info(
+                "[action_runner] Step %s: clicked at (%d, %d) [raw: %d, %d].",
+                step, x, y, raw_x, raw_y,
+            )
+            return
+
+        if action_type == "type":
+            text = str(action.get("value") or "")
+            if not text:
+                logging.warning(
+                    "[action_runner] Step %s: type action has empty value.", step
+                )
+                return
+            pyautogui.write(text, interval=0.05)
+            logging.info("[action_runner] Step %s: typed %d character(s).", step, len(text))
+            return
+
+        if action_type == "wait":
+            raw_value = action.get("value")
+            try:
+                duration = float(raw_value) if raw_value is not None else 1.0
+            except (TypeError, ValueError):
+                duration = 1.0
+            duration = max(0.0, duration)
+            time.sleep(duration)
+            logging.info("[action_runner] Step %s: waited %.2f second(s).", step, duration)
+            return
+
+        if action_type == "shell":
+            raw_cmd = str(action.get("value") or "")
+            if not raw_cmd:
+                logging.warning(
+                    "[action_runner] Step %s: shell action has empty command.", step
+                )
+                return
+            adapted = self._adapter.build_shell_command(raw_cmd)
+            logging.info(
+                "[action_runner] Step %s: running shell: %s", step, " ".join(adapted)
+            )
+            result = subprocess.run(
+                adapted, capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                logging.warning(
+                    "[action_runner] Step %s: shell exited with rc=%d | stderr: %s",
+                    step,
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+            else:
+                logging.info(
+                    "[action_runner] Step %s: shell completed successfully.", step
+                )
+            return
+
+        if action_type == "hotkey":
+            raw_keys = action.get("value")
+            if isinstance(raw_keys, str):
+                keys = [k.strip() for k in raw_keys.split("+") if k.strip()]
+            elif isinstance(raw_keys, list):
+                keys = [str(k).strip() for k in raw_keys if str(k).strip()]
+            else:
+                keys = []
+            if not keys:
+                logging.warning(
+                    "[action_runner] Step %s: hotkey has no valid keys.", step
+                )
+                return
+            pyautogui.hotkey(*keys)
+            logging.info(
+                "[action_runner] Step %s: pressed hotkey %s.", step, " + ".join(keys)
+            )
+            return
+
+        if action_type == "scroll":
+            amount = int(action.get("value") or 0)
+            pyautogui.scroll(amount)
+            logging.info(
+                "[action_runner] Step %s: scrolled %d units.", step, amount
+            )
+            return
+
+        logging.warning(
+            "[action_runner] Step %s: unsupported action_type '%s'.",
+            step,
+            action_type,
+        )
