@@ -19,12 +19,15 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 5:** `executor/safety.py` pure-logic deterministic safety classifier (GREEN/YELLOW/RED) with thread-safe singleton.
 *   [x] **Slice 6:** `executor/screen_capture.py` refactored into context manager with standalone capture().
 *   [x] **Slice 7:** `executor/failsafe.py` PyAutoGUI corner-detection failsafe wrapper.
+*   [x] **Slice 8:** `executor/os_adapter.py` cross-shell command adaptation for Windows.
+*   [x] **Slice 9:** `executor/stdout_watcher.py` process stdout monitoring with signal detection.
+*   [x] **Slice 10:** `executor/hitl_overlay.py` human-in-the-loop decision overlay.
+*   [x] **Slice 11:** `executor/calibrator.py` DPI-aware coordinate scaler.
+*   [x] **Slice 12:** `executor/verification.py` & `executor/recovery.py` vision-feedback loop and action recovery.
 
 ## 4. Current Active Slices (In Progress)
-*   **Slice 8:** `executor/os_adapter.py` (Cross-shell command adaptation for Windows).
-*   **Slice 9:** `executor/stdout_watcher.py` (Process stdout monitoring with signal detection).
-*   **Slice 10:** `executor/hitl_overlay.py` (Human-in-the-loop decision overlay).
+*   **Slice 13:** `extractor/frame_sampler.py` (Video ingestion and frame extraction via ffmpeg).
 
 ## 5. Pending Slices (Do Not Execute Yet)
-*   [ ] **Slice 11:** `main.py` (Central Nervous System / orchestrator).
-*   [ ] **Slice 12:** `ui/app.py` & `ui/static/index.html` (Local demo path).
+*   [ ] **Slice 14:** `main.py` (Central Nervous System / orchestrator).
+*   [ ] **Slice 15:** `ui/app.py` & `ui/static/index.html` (Local demo path).
