@@ -1856,6 +1856,220 @@ LOCAL MILESTONE CONTEXT:
         return {"error": str(e)}
 
 
+class VisionMapper:
+    """Maps two consecutive UI frames to a structured action manifest.
+
+    Sends Frame N and Frame N+1 to a Vision LLM, extracts the delta
+    (what the human clicked / typed), and returns normalized coordinates
+    that are scaled back to the host's physical desktop resolution.
+    """
+
+    # ------------------------------------------------------------------
+    # System Prompt — high-precision vision-to-action instructions
+    # ------------------------------------------------------------------
+
+    SYSTEM_PROMPT = (
+        "You are a precise UI-action extraction engine. "
+        "Your sole task is to compare two consecutive screenshots of a "
+        "desktop tutorial and identify the EXACT action(s) the human "
+        "performed between Frame N and Frame N+1.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Examine both images carefully. Detect what changed: a new window, "
+        "a clicked button, typed text, a menu opened, a key pressed, etc.\n"
+        "2. For EVERY distinct action you identify, emit one JSON object.\n"
+        "3. Coordinates MUST be returned in NORMALIZED [x, y] format on a "
+        "0-1000 scale, where (0,0) is the top-left and (1000,1000) is the "
+        "bottom-right of the screenshot.\n"
+        "4. All coordinates are integers in the range [0, 1000].\n"
+        "5. If an action does not require coordinates (e.g., typing, hotkeys, "
+        "waiting), set coordinates to null.\n"
+        "6. If the action requires a text value (type, wait duration, shell), "
+        "place it in the 'value' field. Otherwise set value to null.\n"
+        "7. Do NOT output markdown fences, prose, or explanations.\n"
+        "8. Return ONLY a valid JSON array.\n\n"
+        "OUTPUT SCHEMA (JSON array):\n"
+        '[{"step": 1, "action_type": "click", "target_description": "...", '
+        '"coordinates": [500, 300], "value": null}, ...]\n\n'
+        "Allowed action_type values: click, type, wait, hotkey, shell, scroll.\n"
+        "- click  : human clicked a UI element. coordinates required.\n"
+        "- type   : human typed text. value = the typed string.\n"
+        "- wait   : a visible pause. value = seconds as a string (e.g. '1.5').\n"
+        "- hotkey : human pressed a keyboard shortcut. value = key name string.\n"
+        "- shell  : human ran a terminal command. value = command string.\n"
+        "- scroll : human scrolled. value = integer scroll amount.\n"
+    )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def __init__(
+        self,
+        *,
+        screen_width: int = 1920,
+        screen_height: int = 1080,
+        dpi_scale: float = 1.2,
+    ) -> None:
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.dpi_scale = dpi_scale
+
+    def compare_frames(
+        self,
+        frame_n_path: Path | str,
+        frame_n1_path: Path | str,
+        timeout: int = 20,
+    ) -> list[dict]:
+        """Send Frame N and Frame N+1 to the vision model and return an
+        ordered list of action dicts.
+
+        Raises *ValueError* if the model returns malformed JSON or the
+        schema is invalid.
+        """
+        encoded_n = get_compressed_base64(frame_n_path)
+        encoded_n1 = get_compressed_base64(frame_n1_path)
+        if not encoded_n or not encoded_n1:
+            raise ValueError("Unable to encode one or both frame images.")
+
+        messages = [
+            {
+                "role": "system",
+                "content": VisionMapper.SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Frame N (before action) and Frame N+1 (after action). "
+                            "Identify the delta. Return ONLY a JSON array of actions."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded_n}"
+                        },
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded_n1}"
+                        },
+                    },
+                ],
+            },
+        ]
+
+        logging.info("[VisionMapper] Sending frame pair to vision model...")
+        response = create_completion_with_fallback(
+            messages=messages,
+            timeout=timeout,
+            temperature=0.0,
+        )
+        raw_text = response.choices[0].message.content
+        actions = self._parse_and_validate(raw_text)
+        # Scale normalized coordinates to physical screen pixels
+        for action in actions:
+            self._apply_coordinate_scaling(action)
+        return actions
+
+    # ------------------------------------------------------------------
+    # Coordinate scaling helper
+    # ------------------------------------------------------------------
+
+    def scale_coordinate(self, norm_x: int, norm_y: int) -> tuple[int, int]:
+        """Convert a normalized [0-1000] coordinate to physical screen
+        pixels, accounting for DPI scaling.
+
+        Formula::
+            physical = (norm / 1000) * resolution / dpi_scale
+        """
+        px = int(round((norm_x / 1000.0) * self.screen_width / self.dpi_scale))
+        py = int(round((norm_y / 1000.0) * self.screen_height / self.dpi_scale))
+        return px, py
+
+    def _apply_coordinate_scaling(self, action: dict) -> None:
+        """In-place scaling of coordinates inside a single action dict."""
+        coords = action.get("coordinates")
+        if isinstance(coords, list) and len(coords) == 2:
+            x, y = self.scale_coordinate(int(coords[0]), int(coords[1]))
+            action["coordinates"] = [x, y]
+
+    # ------------------------------------------------------------------
+    # Markdown fence stripping + schema validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        """Remove triple-backtick code fences (with optional language tag)."""
+        stripped = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip()
+
+    def _parse_and_validate(self, raw_text: str) -> list[dict]:
+        """Strip markdown, parse JSON, repair if needed, and validate schema."""
+        cleaned = self._strip_markdown_fences(raw_text)
+
+        # Try direct parse first
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Fallback to json_repair
+            repaired = repair_json(cleaned)
+            try:
+                payload = json.loads(repaired)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Vision model returned unparseable JSON: {exc}"
+                ) from exc
+
+        if not isinstance(payload, list):
+            raise ValueError(
+                f"Expected a JSON array of actions, got {type(payload).__name__}."
+            )
+
+        validated: list[dict] = []
+        for index, item in enumerate(payload, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Action {index} is not a JSON object.")
+
+            step = item.get("step")
+            if not isinstance(step, int):
+                raise ValueError(f"Action {index}: 'step' must be an integer.")
+
+            action_type = str(item.get("action_type") or "").strip().lower()
+            if action_type not in {"click", "type", "wait", "hotkey", "shell", "scroll"}:
+                raise ValueError(
+                    f"Action {index}: unsupported action_type '{action_type}'."
+                )
+
+            coords = item.get("coordinates")
+            if coords is not None and (
+                not isinstance(coords, list) or len(coords) != 2
+            ):
+                raise ValueError(
+                    f"Action {index}: 'coordinates' must be [x, y] or null."
+                )
+            if coords is not None:
+                for c in coords:
+                    if not isinstance(c, (int, float)):
+                        raise ValueError(
+                            f"Action {index}: coordinates must be numeric."
+                        )
+
+            validated.append({
+                "step": step,
+                "action_type": action_type,
+                "target_description": str(item.get("target_description") or "").strip(),
+                "coordinates": list(coords) if coords is not None else None,
+                "value": item.get("value"),
+            })
+
+        return validated
+
+
 if __name__ == "__main__":
     print("[*] Mimiq Cloud Brain Booting...")
     uvicorn.run(

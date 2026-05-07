@@ -16,7 +16,6 @@ from typing import Any
 
 import pyautogui
 
-from executor.calibrator import get_calibrator
 from executor.hitl_overlay import HitlDecision, show_hitl_overlay
 from executor.os_adapter import get_adapter
 
@@ -30,7 +29,6 @@ class ActionRunner:
     """Orchestrates manifest execution with per-step HITL approval."""
 
     def __init__(self) -> None:
-        self._calibrator = get_calibrator()
         self._adapter = get_adapter()
 
     # ------------------------------------------------------------------
@@ -106,13 +104,12 @@ class ActionRunner:
                     "[action_runner] Step %s: click requires [x, y] coordinates.", step
                 )
                 return
-            raw_x = int(coords[0])
-            raw_y = int(coords[1])
-            x, y = self._calibrator.scale_coordinates(raw_x, raw_y)
+            x = int(coords[0])
+            y = int(coords[1])
             pyautogui.click(x, y)
             logging.info(
-                "[action_runner] Step %s: clicked at (%d, %d) [raw: %d, %d].",
-                step, x, y, raw_x, raw_y,
+                "[action_runner] Step %s: clicked at (%d, %d).",
+                step, x, y,
             )
             return
 
