@@ -15,6 +15,7 @@ from executor.action_runner import ActionRunner
 from executor.failsafe import start_failsafe
 from executor.hitl_overlay import HitlDecision, show_hitl_overlay
 from executor.recovery import get_recovery_manager
+from executor.safety import get_classifier, SafetyLevel
 from executor.screen_capture import capture
 from executor.verification import verify_state_change
 from generator.step_generator import get_generator
@@ -38,13 +39,54 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def execute_step(self, phase: dict, step: dict) -> bool:
-        """Execute every action in *step*, capture before/after, verify."""
+        """Execute every action in *step*, capture before/after, verify.
+
+        Red Zone actions trigger HITL approval BEFORE execution.
+        """
         frames_dir = self.work_root / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
 
+        actions = step.get("actions") or []
+        classifier = get_classifier()
+
+        # --- Pre-execution Red Zone check ---
+        for action in actions:
+            action_type = str(action.get("type") or "").strip().lower()
+
+            if action_type in ("type", "keyboard_input"):
+                text_to_classify = str(action.get("text") or action.get("value") or "")
+            elif action_type == "hotkey":
+                keys = action.get("keys") or []
+                text_to_classify = "+".join(str(k) for k in keys)
+            elif action_type == "click":
+                text_to_classify = str(action.get("target_description") or "")
+            else:
+                text_to_classify = ""
+
+            if not text_to_classify.strip():
+                continue
+
+            level = classifier.classify(text_to_classify)
+            if level is SafetyLevel.RED:
+                logging.warning(
+                    "[orchestrator] RED zone action detected: %r — requesting HITL approval",
+                    text_to_classify,
+                )
+                decision = show_hitl_overlay(
+                    f"⚠️ Red Zone action requires approval:\n\n"
+                    f"Action: {action_type}\n"
+                    f"Content: {text_to_classify!r}\n\n"
+                    f"Approve to proceed, Reject to abort this step.",
+                    timeout=60.0,
+                )
+                if decision is HitlDecision.REJECT:
+                    logging.warning("[orchestrator] HITL rejected Red Zone action. Aborting step.")
+                    return False
+                logging.info("[orchestrator] HITL approved Red Zone action. Proceeding.")
+
+        # --- Normal execution ---
         before = capture(frames_dir / "before")
 
-        actions = step.get("actions") or []
         for action in actions:
             self._runner._execute_single(action)
             time.sleep(0.3)

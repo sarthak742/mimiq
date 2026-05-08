@@ -16,6 +16,7 @@ from pathlib import Path
 
 from config import CLOUD_BRAIN_PORT
 from extractor.deduplicator import Deduplicator
+from extractor.downloader import VideoDownloader
 from extractor.frame_sampler import FrameSampler
 from utils.vision_miner import get_visual_transitions, write_candidate_audit
 from utils.composer import compose_plan
@@ -31,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Mimiq — Ingest a tutorial video and generate an actionable manifest."
+        description="Mimiq — Ingest a YouTube URL or local video and automate it."
     )
     parser.add_argument(
         "--goal",
@@ -42,8 +43,14 @@ def main() -> None:
     parser.add_argument(
         "--video",
         type=str,
-        required=True,
-        help="Path to the local tutorial video (.mp4)",
+        default=None,
+        help="Path to local tutorial video (.mp4)",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="YouTube URL to download and process",
     )
     parser.add_argument(
         "--out-dir",
@@ -85,10 +92,24 @@ def main() -> None:
         frames_dir = work_root / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Extract frames
+        # 1. Resolve video source
+        if args.url:
+            logging.info("[main] YouTube URL detected — downloading via yt-dlp...")
+            downloader = VideoDownloader(work_root / "downloads")
+            video_path = downloader.download(args.url)
+            logging.info("[main] Video ready: %s", video_path)
+        elif args.video:
+            video_path = Path(args.video)
+            if not video_path.exists():
+                logging.error("Video file not found: %s", video_path)
+                sys.exit(1)
+        else:
+            logging.error("Provide either --video (local path) or --url (YouTube).")
+            sys.exit(1)
+
         sampler = FrameSampler()
         raw_frames = sampler.extract_uniform_frames(
-            Path(args.video), count=16, output_dir=frames_dir
+            video_path, count=16, output_dir=frames_dir
         )
 
         # 2. Deduplicate
@@ -108,7 +129,7 @@ def main() -> None:
         propose_payload = {
             "os_name": "Windows",
             "video_url": "",
-            "local_tutorial_path": args.video,
+            "local_tutorial_path": str(video_path),
             "visual_events": transitions,
             "keyframe_paths": [str(p) for p in survivors[:8]],
             "keyframe_descriptions": [],
