@@ -1,9 +1,8 @@
-"""Frame deduplication via Mean Squared Error thresholding.
+"""Frame deduplication via perceptual hashing (average hash).
 
-Uses OpenCV to load extracted frames and NumPy to compute the per-pixel
-MSE between adjacent candidates.  Nearly-identical frames (e.g. two
-consecutive screenshots of a loading spinner) are deleted so only
-meaningful UI-state changes are forwarded to the vision model.
+Uses PIL to resize, grayscale, and hash extracted frames.  Nearly-identical
+frames (e.g. two consecutive screenshots of a loading spinner) are deleted
+so only meaningful UI-state changes are forwarded to the vision model.
 """
 
 from __future__ import annotations
@@ -11,99 +10,107 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import cv2
-import numpy as np
+from PIL import Image
 
 
-def calculate_mse(image_a: np.ndarray, image_b: np.ndarray) -> float:
-    """Return the Mean Squared Error between two identically-shaped images.
+def _average_hash(image: Image.Image, hash_size: int = 8) -> int:
+    """Return an integer average-hash (aHash) for *image*."""
+    gray = image.convert("L").resize(
+        (hash_size, hash_size), Image.Resampling.LANCZOS
+    )
+    pixels = list(gray.getdata())
+    avg = sum(pixels) / len(pixels)
+    bits = "".join("1" if p > avg else "0" for p in pixels)
+    return int(bits, 2)
 
-    The arrays are cast to ``float32`` before subtraction to avoid
-    uint8 wrap-around overflow.
-    """
-    if image_a.shape != image_b.shape:
-        raise ValueError(
-            f"Shape mismatch: {image_a.shape} vs {image_b.shape}"
-        )
 
-    a = image_a.astype(np.float32)
-    b = image_b.astype(np.float32)
-
-    mse = np.mean((a - b) ** 2)
-    return float(mse)
+def _hamming_distance(hash_a: int, hash_b: int) -> int:
+    """Return the number of differing bits between two integer hashes."""
+    x = hash_a ^ hash_b
+    distance = 0
+    while x:
+        distance += 1
+        x &= x - 1
+    return distance
 
 
 class Deduplicator:
     """Stateful deduplicator that walks a list of frame paths and prunes
-    visually-identical neighbours.
+    visually-identical neighbours using perceptual hashing.
     """
+
+    def __init__(self, hash_size: int = 8) -> None:
+        self.hash_size = hash_size
 
     def filter_duplicates(
         self,
         frame_paths: list[Path],
-        threshold: float = 150.0,
+        threshold: int = 5,
     ) -> list[Path]:
         """Return the subset of *frame_paths* that differ from the last
-        kept frame by at least *threshold* MSE.
+        kept frame by at least *threshold* hamming distance.
 
-        Frames whose MSE is **below** *threshold* are considered duplicates
-        and are deleted from disk via ``path.unlink()``.
+        Frames whose hamming distance is **below** *threshold* are
+        considered duplicates and are deleted from disk via ``path.unlink()``.
         """
         if not frame_paths:
             return []
 
         sorted_paths = sorted(frame_paths)
         survivors: list[Path] = []
-        last_kept_image: np.ndarray | None = None
+        last_hash: int | None = None
 
         for path in sorted_paths:
-            image = cv2.imread(str(path))
-            if image is None:
+            try:
+                with Image.open(path) as img:
+                    h = _average_hash(img, self.hash_size)
+            except Exception as exc:
                 logging.warning(
-                    "[deduplicator] Could not read %s; skipping.", path
+                    "[deduplicator] Could not read %s: %s", path, exc
                 )
                 continue
 
-            # First frame is always kept
-            if last_kept_image is None:
+            if last_hash is None:
                 survivors.append(path)
-                last_kept_image = image
+                last_hash = h
                 continue
 
-            try:
-                mse = calculate_mse(last_kept_image, image)
-            except ValueError:
-                # Shape mismatch — keep both to be safe
-                survivors.append(path)
-                last_kept_image = image
-                continue
+            distance = _hamming_distance(last_hash, h)
 
-            if mse < threshold:
-                # Too similar → duplicate; delete and skip
+            if distance < threshold:
                 logging.info(
-                    "[deduplicator] MSE %.1f < %.1f — deleting duplicate %s",
-                    mse,
+                    "[deduplicator] Hamming distance %d < %d — "
+                    "deleting duplicate %s",
+                    distance,
                     threshold,
                     path,
                 )
                 try:
                     path.unlink()
-                except OSError as exc:
+                except OSError as del_exc:
                     logging.warning(
-                        "[deduplicator] Failed to delete %s: %s", path, exc
+                        "[deduplicator] Failed to delete %s: %s",
+                        path,
+                        del_exc,
                     )
             else:
-                # Sufficient visual change → keep
                 logging.info(
-                    "[deduplicator] MSE %.1f >= %.1f — keeping %s",
-                    mse,
+                    "[deduplicator] Hamming distance %d >= %d — keeping %s",
+                    distance,
                     threshold,
                     path,
                 )
                 survivors.append(path)
-                last_kept_image = image
+                last_hash = h
 
         logging.info(
-            "[deduplicator] %d frame(s) survived deduplication.", len(survivors)
+            "[deduplicator] %d frame(s) survived deduplication.",
+            len(survivors),
         )
         return survivors
+
+
+def deduplicate(frame_paths: list[Path], threshold: int = 5) -> list[Path]:
+    """Standalone wrapper around :class:`Deduplicator` for easier importing."""
+    d = Deduplicator()
+    return d.filter_duplicates(frame_paths, threshold=threshold)

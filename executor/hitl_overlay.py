@@ -36,12 +36,14 @@ _overlay_state: dict[str, object] = {
 # ------------------------------------------------------------------
 
 
-def show_hitl_overlay(message: str, timeout: float = 60.0) -> HitlDecision | None:
+def show_hitl_overlay(message: str, timeout: float = 60.0) -> HitlDecision:
     """Block until the human makes a decision or *timeout* expires.
 
     Sets the global overlay state to *pending* and records the prompt
-    *message*.  Polls every 0.5 seconds for a decision.  Returns the
-    decision enum value, or ``None`` on timeout.
+    *message*.  Polls every 0.5 seconds for a decision.
+
+    Returns the decision enum value, or :attr:`HitlDecision.SKIP` on
+    timeout (safe default).
     """
     with _lock:
         _overlay_state["pending"] = True
@@ -57,10 +59,10 @@ def show_hitl_overlay(message: str, timeout: float = 60.0) -> HitlDecision | Non
                 return decision  # type: ignore[return-value]
         time.sleep(0.5)
 
-    # Timeout — clear pending flag
+    # Timeout — clear pending flag and return SKIP (safe default)
     with _lock:
         _overlay_state["pending"] = False
-    return None
+    return HitlDecision.SKIP
 
 
 def set_overlay_decision(decision: HitlDecision) -> None:
@@ -71,3 +73,17 @@ def set_overlay_decision(decision: HitlDecision) -> None:
     """
     with _lock:
         _overlay_state["decision"] = decision
+
+
+def get_overlay_state() -> dict[str, object]:
+    """Return a shallow copy of the current overlay state."""
+    with _lock:
+        return dict(_overlay_state)
+
+
+def reset_overlay_state() -> None:
+    """Clear the message and reset pending / decision to their idle values."""
+    with _lock:
+        _overlay_state["pending"] = False
+        _overlay_state["decision"] = None
+        _overlay_state["message"] = ""

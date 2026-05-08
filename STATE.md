@@ -28,9 +28,18 @@ Build an autonomous desktop agent (Mimiq) that watches a local tutorial video (.
 *   [x] **Slice 14:** `extractor/deduplicator.py` frame deduplication via MSE thresholding.
 *   [x] **Slice 15:** `understander/manifest_generator.py` vision model manifest generation from UI frames.
 *   [x] **Slice 16:** `main.py` central orchestrator — ingestion → deduplication → manifest pipeline.
+*   [x] **Slice 17:** `executor/action_runner.py` HITL-guarded manifest executor with DPI scaling and shell adaptation.
 
-## 4. Current Active Slices (In Progress)
-*   **Slice 17:** `executor/action_runner.py` (HITL-guarded manifest executor with DPI scaling and shell adaptation).
+## 4. Current Status
+**Code Complete — Awaiting API Key. Audit Cleanup Active.**
 
-## 5. Pending Slices (Do Not Execute Yet)
+All core modules are implemented: ingestion (frame_sampler, deduplicator), understanding (manifest_generator), and execution (action_runner with HITL, calibrator, os_adapter, safety, failsafe). The UI slice (app.py & index.html) remains pending until the vision pipeline is validated end-to-end.
+
+## 5. Active Audit Items
+*   **config.py**: Change PROVIDER default from `"gemini"` → `"amd"`.
+*   **executor/hitl_overlay.py**: Return `SKIP` on timeout; add `get_overlay_state()` and `reset_overlay_state()`.
+*   **extractor/deduplicator.py**: Replace OpenCV/NumPy with PIL + perceptual hashing; add standalone `deduplicate()` wrapper.
+*   **Delete**: `understander/manifest_generator.py` (violates architecture spec).
+
+## 6. Pending Slices (Do Not Execute Yet)
 *   [ ] **Slice 18:** `ui/app.py` & `ui/static/index.html` (Local demo path).

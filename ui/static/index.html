@@ -1,0 +1,85 @@
+<!-- FILE: ui/static/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mimiq</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="wordmark">Mimiq</div>
+      <div class="badge" id="amd-badge">
+        <span class="dot"></span>
+        <span class="badge-text">AMD MI300X · unknown</span>
+      </div>
+    </header>
+
+    <!-- Goal input -->
+    <input
+      type="text"
+      id="goal-input"
+      class="goal-input"
+      placeholder="What do you want to automate?"
+      autocomplete="off"
+    >
+
+    <!-- Video upload -->
+    <div class="upload-row">
+      <div class="upload-zone" onclick="document.getElementById('video-input').click()">
+        <span class="label" id="video-label">Tutorial Video</span>
+        <span class="hint">Drop .mp4 here or click to browse</span>
+        <input type="file" id="video-input" accept="video/mp4" style="display:none">
+      </div>
+      <div class="upload-zone" onclick="document.getElementById('video2-input').click()">
+        <span class="label" id="video2-label">Reference Video 2</span>
+        <span class="hint">Optional — drop .mp4 here</span>
+        <input type="file" id="video2-input" accept="video/mp4" style="display:none">
+      </div>
+    </div>
+
+    <!-- Compose button -->
+    <button id="compose-btn" class="btn-primary">
+      <span id="compose-spinner" class="spinner hidden"></span>
+      <span id="compose-text">Compose Plan</span>
+    </button>
+
+    <!-- Phase cards -->
+    <div id="phase-grid" class="phase-grid"></div>
+
+    <!-- Dependency panel -->
+    <div id="dependency-panel" class="dependency-panel hidden">
+      <div class="panel-header" onclick="this.nextElementSibling.classList.toggle('hidden')">
+        <span>Dependency Readiness</span>
+        <span style="color:var(--text-2)">▼</span>
+      </div>
+      <div class="panel-body" id="dependency-body"></div>
+    </div>
+
+    <!-- Execute button -->
+    <div id="execute-section" class="hidden" style="margin-top:1.5rem">
+      <button id="execute-btn" class="btn-primary">Execute Pipeline</button>
+    </div>
+
+    <!-- HITL panel -->
+    <div id="hitl-panel" class="hitl-panel">
+      <div class="hitl-message" id="hitl-message">Action pending approval...</div>
+      <div class="hitl-actions">
+        <button id="btn-approve" class="btn-approve">APPROVE</button>
+        <button id="btn-reject" class="btn-reject">REJECT</button>
+        <button id="btn-skip"   class="btn-skip">SKIP</button>
+      </div>
+    </div>
+
+    <!-- Report link -->
+    <a id="report-link" href="/api/report" target="_blank" class="report-link hidden">
+      View Report →
+    </a>
+  </div>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>

@@ -17,7 +17,7 @@ if load_dotenv is not None:
     load_dotenv()
 
 
-PROVIDER = os.getenv("PROVIDER", "gemini").strip().lower()
+PROVIDER = os.getenv("PROVIDER", "amd").strip().lower()
 
 PRIMARY_VISION_URL = os.getenv("PRIMARY_VISION_URL", "").strip()
 PRIMARY_VISION_KEY = os.getenv("PRIMARY_VISION_KEY", "").strip()
