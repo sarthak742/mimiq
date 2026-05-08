@@ -74,6 +74,10 @@ def main() -> None:
         help="Run calibration wizard only",
     )
     args = parser.parse_args()
+    if args.url and args.video:
+        logging.warning(
+            "[main] Both --url and --video provided; --url takes precedence. --video will be ignored."
+        )
 
     work_root = get_work_root()
     out_dir = Path(args.out_dir).resolve()

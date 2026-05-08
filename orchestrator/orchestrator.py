@@ -60,6 +60,8 @@ class Orchestrator:
                 text_to_classify = "+".join(str(k) for k in keys)
             elif action_type == "click":
                 text_to_classify = str(action.get("target_description") or "")
+            elif action_type == "shell":
+                text_to_classify = str(action.get("command") or action.get("text") or "")
             else:
                 text_to_classify = ""
 
@@ -79,8 +81,8 @@ class Orchestrator:
                     f"Approve to proceed, Reject to abort this step.",
                     timeout=60.0,
                 )
-                if decision is HitlDecision.REJECT:
-                    logging.warning("[orchestrator] HITL rejected Red Zone action. Aborting step.")
+                if decision in (HitlDecision.REJECT, HitlDecision.SKIP):
+                    logging.warning("[orchestrator] HITL rejected/timed-out on Red Zone action. Aborting step.")
                     return False
                 logging.info("[orchestrator] HITL approved Red Zone action. Proceeding.")
 

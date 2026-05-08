@@ -28,20 +28,22 @@ def apply_lookahead_corrections(
         desc_tokens = re.findall(r"[a-zA-Z]+", desc.lower())
 
         for neg in NEGATION_WORDS:
-            if neg not in seg_tokens:
+            if "lookahead_warning" in phase_copy:
+                break
+            all_neg_indices = [i for i, t in enumerate(seg_tokens) if t == neg]
+            if not all_neg_indices:
                 continue
-            neg_idx = seg_tokens.index(neg)
             for dtoken in desc_tokens:
+                if "lookahead_warning" in phase_copy:
+                    break
                 for s_idx, stoken in enumerate(seg_tokens):
-                    if stoken == dtoken and abs(s_idx - neg_idx) <= 3:
+                    if stoken != dtoken:
+                        continue
+                    if any(abs(s_idx - neg_idx) <= 3 for neg_idx in all_neg_indices):
                         phase_copy["lookahead_warning"] = (
                             f"Negation detected near '{dtoken}': '{neg}'"
                         )
                         break
-                if "lookahead_warning" in phase_copy:
-                    break
-            if "lookahead_warning" in phase_copy:
-                break
 
         corrected.append(phase_copy)
 

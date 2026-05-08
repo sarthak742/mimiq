@@ -148,10 +148,17 @@ def verify_state_change(
             "[verify] vision_state request failed (%s), falling back to ocr_focus",
             exc,
         )
-        return verify_state_change(
-            before_path,
-            after_path,
-            success_signals,
-            failure_signals,
-            mode="ocr_focus",
-        )
+        try:
+            return verify_state_change(
+                before_path,
+                after_path,
+                success_signals,
+                failure_signals,
+                mode="ocr_focus",
+            )
+        except Exception as fallback_exc:
+            logging.warning(
+                "[verify] ocr_focus fallback also failed (%s), returning soft failure",
+                fallback_exc,
+            )
+            return {"success": False, "mode": "failed", "error": str(fallback_exc)}

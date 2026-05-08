@@ -73,11 +73,11 @@ class VideoDownloader:
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
     def download(self, url: str) -> Path:
-        """Download *url* to self.download_dir using yt-dlp.
-
-        Returns the Path to the downloaded .mp4 file.
-        """
-        output_template = str(self.download_dir / "%(title)s.%(ext)s")
+        """Download *url* using yt-dlp. Each call writes to a unique subdirectory."""
+        import time as _time
+        run_dir = self.download_dir / f"run_{int(_time.time() * 1000)}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        output_template = str(run_dir / "%(title)s.%(ext)s")
 
         logging.info("[downloader] Downloading video: %s", url)
 
@@ -110,11 +110,11 @@ class VideoDownloader:
         if result.returncode != 0:
             logging.warning("[downloader] yt-dlp stderr: %s", result.stderr.strip())
 
-        mp4_files = list(self.download_dir.glob("*.mp4"))
+        mp4_files = list(run_dir.glob("*.mp4"))
         if not mp4_files:
             raise RuntimeError(f"yt-dlp download failed for {url}")
 
-        video_path = max(mp4_files, key=lambda p: p.stat().st_mtime)
+        video_path = mp4_files[0]  # only ever one file in the run_dir
         logging.info("[downloader] Video saved: %s", video_path)
         return video_path
 
